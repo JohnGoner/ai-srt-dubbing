@@ -1,0 +1,54 @@
+# AI配音系统配置文件示例
+# 复制此文件为 config.yaml 并填入您的真实API密钥
+
+# API配置
+api_keys:
+  openai_api_key: "your-openai-api-key-here"
+  azure_speech_key_1: "your-azure-speech-key-1-here"
+  azure_speech_key_2: "your-azure-speech-key-2-here"  # 可选，用于备份
+  azure_speech_region: "eastus"  # 您的Azure语音服务区域
+  azure_speech_endpoint: "https://eastus.api.cognitive.microsoft.com/"
+
+# 翻译配置
+translation:
+  model: "gpt-4o"
+  max_tokens: 4000
+  temperature: 0.3
+  system_prompt: |
+    你是一个专业的配音翻译专家。请将中文文本翻译成指定的目标语言，
+    需要考虑以下要求：
+    1. 保持语义准确和上下文连贯
+    2. 考虑时间码约束，确保翻译后的文本能在指定时间内读完
+    3. 保持自然的语言表达
+    4. 适合配音的语调和节奏
+
+# TTS配置
+tts:
+  azure:
+    voices:
+      en: "en-US-AndrewMultilingualNeural"
+      es: "es-MX-JorgeNeural"
+      fr: "fr-FR-DeniseNeural"
+      de: "de-DE-KatjaNeural"
+      ja: "ja-JP-NanamiNeural"
+      ko: "ko-KR-SunHiNeural"
+  
+  speech_rate: 1.0  # 语速 (0.5-2.0)
+  pitch: 0  # 音调 (-50 to 50)
+  volume: 90  # 音量 (0-100)
+
+# 时间同步配置
+timing:
+  max_speed_ratio: 1.15  # 最大语速调整比例
+  min_speed_ratio: 0.95  # 最小语速调整比例
+  silence_padding: 0.1   # 静音填充时间(秒)
+  sync_tolerance: 0.15   # 时间同步容忍度(秒)
+  preferred_breathing_gap: 0.3  # 理想呼吸间隙时间(秒)
+  min_overlap_buffer: 0.05      # 最小缓冲时间(秒)
+
+# 输出配置
+output:
+  audio_format: "mp3"
+  sample_rate: 48000
+  channels: 1
+  bit_depth: 16 
