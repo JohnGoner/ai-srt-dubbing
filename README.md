@@ -1,6 +1,6 @@
 # AI配音系统
 
-![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 
@@ -198,7 +198,7 @@ SRT字幕 → 智能分段 → 并发翻译 → 循环逼近时间同步 → TTS
 
 ## 📈 版本历史
 
-### v3.0.0 (2024-12-19) - 重大性能优化
+### v1.0.1 (2024-12-19) - 重大性能优化
 - ✨ **智能分段系统**：基于字符数的智能字幕重组
 - 🚀 **并发架构**：8线程翻译 + 6线程TTS并发
 - 🔄 **Kimi API支持**：Kimi K2-0711-Preview集成
@@ -207,11 +207,6 @@ SRT字幕 → 智能分段 → 并发翻译 → 循环逼近时间同步 → TTS
 - 🖥️ **Web界面**：Streamlit可视化操作界面
 - 🛡️ **双密钥切换**：Azure TTS故障自动切换
 - 📊 **性能监控**：Token使用统计和成本报告
-
-### v2.0.0 (2024-01-01) - 循环逼近算法
-- 🔄 循环逼近时间同步算法
-- 🎯 精确语速控制
-- 📈 时间同步精度提升
 
 ### v1.0.0 (2024-01-01) - 初始版本
 - 📝 基础SRT字幕配音
