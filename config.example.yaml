@@ -3,7 +3,14 @@
 
 # API配置
 api_keys:
+  # Kimi API配置（推荐使用）
+  kimi_api_key: "your-kimi-api-key-here"
+  kimi_base_url: "https://api.moonshot.cn/v1"
+  
+  # OpenAI API配置（备用）
   openai_api_key: "your-openai-api-key-here"
+  
+  # Azure TTS配置
   azure_speech_key_1: "your-azure-speech-key-1-here"
   azure_speech_key_2: "your-azure-speech-key-2-here"  # 可选，用于备份
   azure_speech_region: "eastus"  # 您的Azure语音服务区域
@@ -11,9 +18,24 @@ api_keys:
 
 # 翻译配置
 translation:
-  model: "gpt-4o"
-  max_tokens: 4000
+  model: "kimi-k2-0711-preview"  # 主翻译模型 - Kimi K2
+  segmentation_model: "kimi-k2-0711-preview"  # 字幕分段模型
+  max_tokens: 8000  # 放宽tokens限制，Kimi K2支持更多tokens
   temperature: 0.3
+  use_kimi: true  # 启用Kimi API
+  
+  # 分段配置
+  max_segments_per_batch: 15  # 每批次最大段落数
+  max_chars_per_batch: 1500   # 每批次最大字符数
+  overlap_sentences: 2        # 批次间重叠句子数
+  
+  # 并发配置
+  max_concurrent_batches: 5   # 最大并发批次数
+  
+  # 审核配置
+  enable_batch_review: true   # 启用批次间审核
+  review_overlap_sentences: 3 # 审核时的重叠句子数
+  
   system_prompt: |
     你是一个专业的配音翻译专家。请将中文文本翻译成指定的目标语言，
     需要考虑以下要求：
@@ -28,10 +50,7 @@ tts:
     voices:
       en: "en-US-AndrewMultilingualNeural"
       es: "es-MX-JorgeNeural"
-      fr: "fr-FR-DeniseNeural"
-      de: "de-DE-KatjaNeural"
-      ja: "ja-JP-NanamiNeural"
-      ko: "ko-KR-SunHiNeural"
+
   
   speech_rate: 1.0  # 语速 (0.5-2.0)
   pitch: 0  # 音调 (-50 to 50)
@@ -39,12 +58,20 @@ tts:
 
 # 时间同步配置
 timing:
-  max_speed_ratio: 1.15  # 最大语速调整比例
-  min_speed_ratio: 0.95  # 最小语速调整比例
-  silence_padding: 0.1   # 静音填充时间(秒)
-  sync_tolerance: 0.15   # 时间同步容忍度(秒)
-  preferred_breathing_gap: 0.3  # 理想呼吸间隙时间(秒)
-  min_overlap_buffer: 0.05      # 最小缓冲时间(秒)
+  sync_tolerance: 0.15  # 时间同步容忍度（15%）
+  max_iterations: 3     # 最大循环次数
+  max_speed_ratio: 1.15 # 最大语速倍率
+  min_speed_ratio: 0.95 # 最小语速倍率
+  max_speed_variation: 0.1  # 最大语速波动
+  
+  # 优化设置 - 减少API调用
+  enable_cost_optimization: true  # 启用成本优化模式
+  use_estimation_first: true      # 优先使用估算方法
+  max_api_calls_per_segment: 2    # 每个片段最大API调用次数
+  
+  # 音频时长控制
+  preferred_breathing_gap: 0.3    # 理想呼吸间隙时间（秒）
+  min_overlap_buffer: 0.05        # 最小缓冲时间（秒）
 
 # 输出配置
 output:

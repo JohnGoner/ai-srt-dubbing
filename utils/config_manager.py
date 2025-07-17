@@ -1,28 +1,78 @@
 """
-配置文件管理器
-智能查找和管理项目配置文件
+配置管理模块
+处理系统配置文件的加载、验证和管理
 """
 
-import os
 import yaml
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from loguru import logger
+import hashlib
+import time
+
+
+class CacheManager:
+    """简单的全局缓存管理器"""
+    
+    def __init__(self, max_size: int = 500):
+        self.cache = {}
+        self.access_times = {}
+        self.max_size = max_size
+    
+    def get(self, key: str) -> Any:
+        """获取缓存项"""
+        if key in self.cache:
+            self.access_times[key] = time.time()
+            return self.cache[key]
+        return None
+    
+    def set(self, key: str, value: Any):
+        """设置缓存项"""
+        # 如果缓存已满，清理最少使用的项
+        if len(self.cache) >= self.max_size:
+            self._cleanup_cache()
+        
+        self.cache[key] = value
+        self.access_times[key] = time.time()
+    
+    def _cleanup_cache(self):
+        """清理缓存（简单LRU）"""
+        # 删除最少使用的一半项目
+        sorted_items = sorted(self.access_times.items(), key=lambda x: x[1])
+        items_to_remove = len(sorted_items) // 2
+        
+        for key, _ in sorted_items[:items_to_remove]:
+            del self.cache[key]
+            del self.access_times[key]
+    
+    def clear(self):
+        """清空缓存"""
+        self.cache.clear()
+        self.access_times.clear()
+    
+    def get_cache_key(self, *args) -> str:
+        """生成缓存键"""
+        content = "_".join(str(arg) for arg in args)
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+
+# 全局缓存实例
+global_cache = CacheManager()
 
 
 class ConfigManager:
-    """配置文件管理器"""
+    """配置管理器"""
     
-    def __init__(self, config_filename: str = "config.yaml"):
-        """
-        初始化配置管理器
-        
-        Args:
-            config_filename: 配置文件名，默认为 config.yaml
-        """
-        self.config_filename = config_filename
-        self.config_path = None
+    def __init__(self):
+        """初始化配置管理器"""
+        self.config_cache = {}
+        self.config_filenames = [
+            'config.yaml',
+            'config.yml'
+        ]
         self.config = None
+        self.config_path = None
         
     def find_config_file(self) -> Optional[str]:
         """
@@ -34,34 +84,38 @@ class ConfigManager:
         # 获取当前脚本的目录
         current_script_dir = Path(__file__).parent
         
-        # 可能的配置文件路径（按优先级排序）
-        possible_paths = [
+        # 可能的配置文件目录（按优先级排序）
+        possible_dirs = [
             # 项目根目录（从utils目录向上一级）
-            current_script_dir.parent / self.config_filename,
+            current_script_dir.parent,
             
             # 当前脚本目录
-            current_script_dir / self.config_filename,
+            current_script_dir,
             
             # 当前工作目录
-            Path.cwd() / self.config_filename,
-            
-            # 相对于当前工作目录的路径
-            Path(self.config_filename),
+            Path.cwd(),
             
             # 用户主目录
-            Path.home() / f".{self.config_filename}",
+            Path.home(),
             
             # 系统配置目录
-            Path("/etc") / self.config_filename,
+            Path("/etc"),
         ]
         
-        # 在每个路径中搜索配置文件
-        for path in possible_paths:
-            if path.exists() and path.is_file():
-                logger.info(f"找到配置文件: {path}")
-                return str(path.resolve())
+        # 在每个目录中搜索配置文件
+        for directory in possible_dirs:
+            for filename in self.config_filenames:
+                # 对于用户主目录，使用隐藏文件名
+                if directory == Path.home():
+                    path = directory / f".{filename}"
+                else:
+                    path = directory / filename
+                
+                if path.exists() and path.is_file():
+                    logger.info(f"找到配置文件: {path}")
+                    return str(path.resolve())
         
-        logger.warning(f"未找到配置文件 {self.config_filename}")
+        logger.warning(f"未找到配置文件 (搜索了: {', '.join(self.config_filenames)})")
         return None
     
     def load_config(self, config_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -136,14 +190,21 @@ class ConfigManager:
         """
         current_script_dir = Path(__file__).parent
         
-        paths = [
-            str(current_script_dir.parent / self.config_filename),
-            str(current_script_dir / self.config_filename),
-            str(Path.cwd() / self.config_filename),
-            str(Path(self.config_filename)),
-            str(Path.home() / f".{self.config_filename}"),
-            str(Path("/etc") / self.config_filename),
+        paths = []
+        possible_dirs = [
+            current_script_dir.parent,
+            current_script_dir,
+            Path.cwd(),
+            Path.home(),
+            Path("/etc"),
         ]
+        
+        for directory in possible_dirs:
+            for filename in self.config_filenames:
+                if directory == Path.home():
+                    paths.append(str(directory / f".{filename}"))
+                else:
+                    paths.append(str(directory / filename))
         
         return paths
     

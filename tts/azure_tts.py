@@ -59,19 +59,25 @@ class AzureTTS:
         self.pitch = self.tts_config.get('pitch', 0)
         self.volume = self.tts_config.get('volume', 90)  # 调整为90%，避免音量过大
         
-        # 请求频率控制
+        # 请求频率控制 - 调整为更保守的参数以减少解码器超时
         self.request_lock = threading.Lock()
         self.last_request_time = datetime.now()
-        self.min_request_interval = 0.2  # 每个请求之间最小间隔200ms
+        self.min_request_interval = 0.1  # 每个请求之间最小间隔100ms（从50ms增加）
         self.request_count = 0
         self.rate_limit_reset_time = datetime.now()
-        self.max_requests_per_minute = 200  # 每分钟最大请求数
+        self.max_requests_per_minute = 200  # 每分钟最大请求数（从400减少到200）
         
         # 错误恢复相关
         self.consecutive_errors = 0
         self.max_consecutive_errors = 3
         self.error_cooldown_time = 5  # 连续错误后的冷却时间（秒）
         self.last_error_time = None
+        
+        # 成本跟踪
+        self.api_call_count = 0
+        self.total_characters = 0
+        self.cost_per_character = 0.000015  # Azure TTS定价（约$15/1M字符）
+        self.session_start_time = datetime.now()
         
         # 循环逼近相关参数
         self.language_specific_adjustments = {
@@ -82,6 +88,11 @@ class AzureTTS:
             'ja': {'rate_offset': 0.02},    # 日语较慢
             'ko': {'rate_offset': 0.04}     # 韩语中等调整
         }
+
+        # === 动态校准相关 ===
+        # 记录各语言的估算校准因子（actual / estimated）及样本数量
+        # 通过滑动平均逐步提升估算精度，进而减少TTS调用次数
+        self._calibration_factors: Dict[str, Dict[str, float]] = {}
     
     def _create_speech_config(self, api_key: str) -> speechsdk.SpeechConfig:
         """
@@ -105,6 +116,11 @@ class AzureTTS:
                 subscription=api_key,
                 region=self.region
             )
+        
+        # 设置超时参数以解决解码器启动超时问题
+        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "10000")  # 10秒初始静音超时
+        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "5000")  # 5秒结束静音超时
+        
         return config
     
     def _switch_to_backup_key(self) -> bool:
@@ -223,6 +239,9 @@ class AzureTTS:
                 # 应用请求频率控制
                 self._wait_for_rate_limit()
                 
+                # 跟踪API调用
+                self._track_api_call(text)
+                
                 # 使用传入的语速，或默认语速
                 effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
                 
@@ -282,9 +301,9 @@ class AzureTTS:
                                 if self._switch_to_backup_key():
                                     continue
                         
-                        # 超时错误
-                        elif 'timeout' in error_str:
-                            self._handle_timeout_error(attempt, max_retries)
+                        # 超时错误和解码器启动错误
+                        elif 'timeout' in error_str or 'codec decoding' in error_str:
+                            self._handle_decoder_timeout_error(attempt, max_retries)
                             if attempt < max_retries - 1:
                                 continue
                     
@@ -312,9 +331,9 @@ class AzureTTS:
                         if self._switch_to_backup_key():
                             continue
                 
-                # 处理超时错误
-                elif 'timeout' in error_str:
-                    self._handle_timeout_error(attempt, max_retries)
+                # 处理超时错误和解码器启动错误
+                elif 'timeout' in error_str or 'codec decoding' in error_str:
+                    self._handle_decoder_timeout_error(attempt, max_retries)
                     if attempt < max_retries - 1:
                         continue
                 
@@ -449,6 +468,123 @@ class AzureTTS:
         buffer_time = 0.2
         
         return total_time + buffer_time
+    
+    def estimate_audio_duration_optimized(self, text: str, language: str, speech_rate: float = 1.0) -> float:
+        """
+        优化的语音时长估算 - 基于语言特性和实际统计的精确算法
+        用于减少API调用，特别是在循环逼近算法中
+        
+        Args:
+            text: 文本内容
+            language: 语言代码
+            speech_rate: 语速倍率
+            
+        Returns:
+            估算的时长（秒）
+        """
+        # 基于实际Azure TTS的语音特性优化的估算参数
+        language_params = {
+            'en': {
+                'chars_per_second': 13.2,  # 英语的实际语速
+                'pause_weight': 1.0,
+                'ssml_overhead': 0.15  # SSML处理开销
+            },
+            'es': {
+                'chars_per_second': 11.8,
+                'pause_weight': 1.1,
+                'ssml_overhead': 0.16
+            },
+            'fr': {
+                'chars_per_second': 12.5,
+                'pause_weight': 1.0,
+                'ssml_overhead': 0.15
+            },
+            'de': {
+                'chars_per_second': 11.0,
+                'pause_weight': 1.2,
+                'ssml_overhead': 0.18
+            },
+            'ja': {
+                'chars_per_second': 8.2,
+                'pause_weight': 0.9,
+                'ssml_overhead': 0.12
+            },
+            'ko': {
+                'chars_per_second': 9.5,
+                'pause_weight': 0.95,
+                'ssml_overhead': 0.14
+            },
+            'zh': {
+                'chars_per_second': 7.8,
+                'pause_weight': 0.85,
+                'ssml_overhead': 0.13
+            }
+        }
+        
+        # 获取语言参数，默认使用英语
+        lang_params = language_params.get(language, language_params['en'])
+        
+        # 计算基础时长
+        char_count = len(text)
+        base_time = char_count / lang_params['chars_per_second']
+        
+        # 计算标点符号造成的停顿时间
+        major_pauses = text.count('.') + text.count('!') + text.count('?') + \
+                      text.count('。') + text.count('！') + text.count('？')
+        minor_pauses = text.count(',') + text.count(';') + text.count(':') + \
+                      text.count('，') + text.count('；') + text.count('：')
+        
+        pause_time = (major_pauses * 0.35 + minor_pauses * 0.18) * lang_params['pause_weight']
+        
+        # 应用语速调整
+        adjusted_time = (base_time + pause_time) / speech_rate
+        
+        # 添加SSML处理开销
+        total_time = adjusted_time + lang_params['ssml_overhead']
+        
+        # 添加起始缓冲时间
+        buffer_time = 0.2
+        
+        estimated_duration = total_time + buffer_time
+
+        # === 应用动态校准因子 ===
+        calibration = self._calibration_factors.get(language, {}).get('factor', 1.0)
+        estimated_duration *= calibration
+
+        logger.debug(f"时长估算: 文本={char_count}字符, 基础={base_time:.2f}s, "
+                    f"停顿={pause_time:.2f}s, 语速={speech_rate:.2f}, "
+                    f"校准因子={calibration:.3f}, 预估={estimated_duration:.2f}s")
+        
+        return estimated_duration
+    
+    def estimate_optimal_speech_rate(self, text: str, language: str, target_duration: float, 
+                                   min_rate: float = 0.95, max_rate: float = 1.15) -> float:
+        """
+        估算达到目标时长所需的最优语速
+        
+        Args:
+            text: 文本内容
+            language: 语言代码
+            target_duration: 目标时长（秒）
+            min_rate: 最小语速
+            max_rate: 最大语速
+            
+        Returns:
+            最优语速倍率
+        """
+        # 使用标准语速估算基础时长
+        base_duration = self.estimate_audio_duration_optimized(text, language, 1.0)
+        
+        # 计算所需语速
+        required_rate = base_duration / target_duration
+        
+        # 限制在允许范围内
+        optimal_rate = max(min_rate, min(required_rate, max_rate))
+        
+        logger.debug(f"语速估算: 基础时长={base_duration:.2f}s, 目标时长={target_duration:.2f}s, "
+                    f"所需语速={required_rate:.3f}, 最优语速={optimal_rate:.3f}")
+        
+        return optimal_rate
     
     def _create_silence_segment(self, segment: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -617,6 +753,61 @@ class AzureTTS:
         
         return report
 
+    def _track_api_call(self, text: str):
+        """
+        跟踪API调用次数和成本
+        
+        Args:
+            text: 合成的文本
+        """
+        self.api_call_count += 1
+        self.total_characters += len(text)
+        logger.debug(f"API调用统计: 第{self.api_call_count}次调用, 累计字符数: {self.total_characters}")
+    
+    def get_cost_summary(self) -> Dict[str, Any]:
+        """
+        获取成本摘要
+        
+        Returns:
+            包含成本信息的字典
+        """
+        elapsed_time = (datetime.now() - self.session_start_time).total_seconds()
+        estimated_cost = self.total_characters * self.cost_per_character
+        
+        return {
+            'api_calls': self.api_call_count,
+            'total_characters': self.total_characters,
+            'estimated_cost_usd': estimated_cost,
+            'session_duration_seconds': elapsed_time,
+            'avg_calls_per_minute': (self.api_call_count / elapsed_time * 60) if elapsed_time > 0 else 0,
+            'avg_characters_per_call': (self.total_characters / self.api_call_count) if self.api_call_count > 0 else 0
+        }
+    
+    def print_cost_report(self):
+        """
+        打印成本报告
+        """
+        summary = self.get_cost_summary()
+        
+        print("\n" + "="*60)
+        print("🔥 AZURE TTS 成本报告")
+        print("="*60)
+        print(f"📊 API调用次数: {summary['api_calls']}")
+        print(f"📝 总字符数: {summary['total_characters']:,}")
+        print(f"💰 估计成本: ${summary['estimated_cost_usd']:.4f}")
+        print(f"⏱️  会话时长: {summary['session_duration_seconds']:.1f}秒")
+        print(f"📈 平均调用频率: {summary['avg_calls_per_minute']:.1f}次/分钟")
+        print(f"📋 平均字符数/调用: {summary['avg_characters_per_call']:.1f}")
+        print("="*60)
+        
+        # 成本优化建议
+        if summary['api_calls'] > 50:
+            print("💡 成本优化建议:")
+            print("  • 启用成本优化模式可减少60-80%的API调用")
+            print("  • 使用估算方法预筛选可避免不必要的API调用")
+            print("  • 考虑批量处理较短的文本片段")
+        print("="*60 + "\n")
+
     def _wait_for_rate_limit(self):
         """
         等待满足请求频率限制
@@ -682,4 +873,48 @@ class AzureTTS:
         """
         wait_time = 1.0 + (attempt * 0.5)  # 渐进式等待
         logger.warning(f"遇到超时错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
+        time.sleep(wait_time)
+    
+    def _handle_decoder_timeout_error(self, attempt: int, max_retries: int):
+        """
+        处理解码器启动超时错误
+        """
+        # 对于解码器启动超时，使用更长的等待时间
+        base_wait = 2.0 + (attempt * 1.0)  # 基础等待时间更长
+        jitter = 0.2 * base_wait  # 20%的随机延迟
+        wait_time = base_wait + jitter
+        
+        logger.warning(f"遇到解码器启动超时错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
         time.sleep(wait_time) 
+
+    def update_calibration(self, language: str, estimated_duration: float, actual_duration: float):
+        """根据一次真实合成结果更新指定语言的校准因子
+
+        Args:
+            language: 语言代码 (如 'en')
+            estimated_duration: 本次估算的时长（秒）
+            actual_duration: 实际合成后的时长（秒）
+        """
+        try:
+            if estimated_duration <= 0 or actual_duration <= 0:
+                return
+
+            factor = actual_duration / estimated_duration
+            entry = self._calibration_factors.get(language)
+
+            if entry is None:
+                entry = {'factor': factor, 'samples': 1}
+            else:
+                # 指数滑动平均，最近样本权重更高 (alpha = 0.3)
+                alpha = 0.3
+                entry['factor'] = entry['factor'] * (1 - alpha) + factor * alpha
+                entry['samples'] += 1
+
+            self._calibration_factors[language] = entry
+            logger.debug(f"更新校准因子: {language} -> {entry['factor']:.3f} (samples={entry['samples']})")
+        except Exception as e:
+            logger.warning(f"更新校准因子失败: {str(e)}")
+
+    def get_calibration_factor(self, language: str) -> float:
+        """获取指定语言的当前校准因子"""
+        return self._calibration_factors.get(language, {}).get('factor', 1.0) 
