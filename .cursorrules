@@ -1,0 +1,132 @@
+# AI配音系统 - Cursor Rules v1.1.0
+
+## 项目概述
+基于Kimi/GPT和Azure TTS的智能SRT字幕翻译与语音合成系统，实现高精度时间同步的多语言配音。
+
+## 核心架构
+
+### 模块结构
+- **translation/**: 智能翻译引擎（Kimi K2 + OpenAI GPT-4）
+- **audio_processor/**: 音频处理与智能分段
+- **timing/**: 时间同步管理与循环逼近算法
+- **tts/**: Azure TTS语音合成引擎
+- **ui/**: Streamlit组件化界面
+- **models/**: 统一数据结构（SegmentDTO）
+- **utils/**: 工具函数与配置管理
+
+### 数据流
+```
+SRT字幕 → 智能分段 → 并发翻译 → 文本优化 → TTS合成 → 时间同步 → 音频确认 → 最终输出
+```
+
+## 核心数据结构
+
+### SegmentDTO - 统一片段模型
+```python
+@dataclass
+class SegmentDTO:
+    # 基础信息
+    id: str                    # 片段唯一标识
+    start: float              # 开始时间（秒）
+    end: float                # 结束时间（秒）
+    
+    # 多阶段文本处理
+    original_text: str        # 原始字幕文本
+    translated_text: str      # 第一轮翻译结果
+    optimized_text: str       # 算法优化后文本
+    final_text: str          # 最终TTS使用文本
+    
+    # 时间与音频
+    target_duration: float    # 目标时长
+    actual_duration: float    # 实际音频时长
+    speech_rate: float        # 语速倍率
+    
+    # 质量评估
+    quality: str             # 质量评级
+    timing_error_ms: float   # 时长误差
+    sync_ratio: float        # 同步比例
+```
+
+## 核心功能逻辑
+
+### 1. 智能翻译引擎
+- **双API支持**: Kimi K2-0711-preview（主）+ OpenAI GPT-4（备）
+- **多版本策略**: minimal(0.6x)/compact(0.75x)/standard(1.0x)/detailed(1.3x)
+- **精确长度控制**: 字符数精确匹配目标时长
+- **并发优化**: 支持50并发，200 RPM限制
+
+### 2. 精确TTS控制
+- **Azure TTS双密钥**: 故障切换机制
+- **循环逼近算法**: 精确语速控制（0.95-1.15x）
+- **动态校准**: 实时优化估算精度
+- **高保真输出**: 48kHz音频质量
+
+### 3. 时间同步算法
+- **智能分段**: 保持句子完整性
+- **重叠处理**: 自然语音过渡
+- **误差容忍**: 20%同步容忍度
+- **迭代优化**: 最大5轮优化
+
+### 4. 模块化UI架构
+- **工作流管理**: WorkflowManager统一协调
+- **组件化设计**: 各阶段独立组件
+- **实时预览**: 音频确认界面
+- **质量评估**: 智能建议系统
+
+## 开发规范
+
+### 代码风格
+- 中文注释，英文函数名，保持简洁
+- 使用类型提示 `from typing import`
+- 模块化设计：translation, audio_processor, timing, tts, ui, utils
+- 异常处理和降级方案
+
+### API优化原则
+- **优先考虑token效率**: 简化prompt，减少冗余
+- **支持双API切换**: 通过config.yaml的use_kimi控制
+- **并发控制**: 根据API限制调整并发数和延迟
+- **缓存机制**: 避免重复翻译
+- **统计监控**: 记录token使用，接近限制时警告
+
+### 错误处理
+- 每个API调用都要异常处理
+- 提供降级方案：GPT失败用规则方法，TTS失败用默认设置
+- 使用loguru记录错误详情
+
+### 配置管理
+- 所有配置通过config.yaml管理
+- 敏感信息（API密钥）单独管理
+- 支持Kimi和OpenAI API切换
+
+## 性能特性
+
+### 并发处理
+- 翻译并发: 50请求/分钟
+- TTS并发: 8请求/分钟
+- 缓存命中: 智能重复检测
+
+### 精度控制
+- 时长误差: <100ms
+- 字符匹配: ±8字符容差
+- 同步比例: 0.95-1.15范围
+
+### 成本优化
+- Token统计: 实时使用量监控
+- 缓存机制: 避免重复翻译
+- 降级策略: API故障自动切换
+
+## 禁止事项
+- ❌ 不创建.md文档文件
+- ❌ 不生成测试脚本
+- ❌ 不过度优化，保持可读性
+- ❌ 不硬编码配置值
+
+## 推荐事项
+- ✅ 优先考虑token效率
+- ✅ 实现降级方案
+- ✅ 使用类型提示
+- ✅ 记录详细日志
+- ✅ 支持并发处理
+- ✅ 监控API使用率
+
+遵循这些规则确保代码质量和系统性能最优化。 
