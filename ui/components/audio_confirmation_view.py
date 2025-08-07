@@ -21,7 +21,7 @@ class AudioConfirmationView:
     def render(self, optimized_segments: List[SegmentDTO], 
                confirmation_segments: List[SegmentDTO],
                translated_original_segments: List[SegmentDTO], 
-               target_lang: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        target_lang: str, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         渲染音频确认界面
         
@@ -140,8 +140,23 @@ class AudioConfirmationView:
             st.metric("实际时长", f"{actual_duration:.2f}s")
         
         with col4:
-            error_ms = current_segment.timing_error_ms or 0
-            st.metric("时长误差", f"{error_ms:.0f}ms")
+            # 计算带正负号的时长误差
+            if current_segment.actual_duration and current_segment.target_duration:
+                error_ms = (current_segment.actual_duration - current_segment.target_duration) * 1000
+                if error_ms > 0:
+                    error_display = f"+{error_ms:.0f}ms"
+                    error_help = "音频比目标时长长（慢了）"
+                elif error_ms < 0:
+                    error_display = f"{error_ms:.0f}ms"
+                    error_help = "音频比目标时长短（快了）"
+                else:
+                    error_display = "0ms"
+                    error_help = "完美匹配目标时长"
+            else:
+                error_display = "N/A"
+                error_help = "缺少时长数据"
+            
+            st.metric("时长误差", error_display, help=error_help)
         
         with col5:
             sync_ratio = current_segment.sync_ratio
@@ -173,61 +188,56 @@ class AudioConfirmationView:
             
             st.markdown(f"**{text_source}:**")
             
-            # 获取当前文本
-            current_text = current_segment.get_current_text()
+            # 使用segment ID作为key，确保文本状态持久化
+            text_key = f"text_edit_{current_segment.id}"
+            
+            # 获取当前应该显示的文本
+            current_segment_text = current_segment.get_current_text()
+            
+            # 检查是否需要重置文本框（比如重新生成音频后）
+            reset_key = f"reset_text_{current_segment.id}"
+            should_reset = st.session_state.get(reset_key, False)
+            
+            if should_reset:
+                # 清除重置标记和旧的文本状态
+                if reset_key in st.session_state:
+                    del st.session_state[reset_key]
+                if text_key in st.session_state:
+                    del st.session_state[text_key]
+                logger.debug(f"重置片段 {current_segment.id} 的文本输入框")
+            
+            # 初始化文本状态（如果不存在）
+            if text_key not in st.session_state:
+                st.session_state[text_key] = current_segment_text
+                logger.debug(f"初始化片段 {current_segment.id} 的文本: {current_segment_text[:50]}...")
             
             # 创建文本输入框
             new_text = st.text_area(
                 "优化翻译", 
-                current_text, 
+                value=st.session_state[text_key], 
                 height=120, 
-                key=f"optimized_{current_index}",
+                key=text_key,
                 label_visibility="collapsed",
-                help="修改文本后会自动检测变化，点击「更新音频」按钮重新生成"
+                help="修改文本后点击「重新生成音频」按钮应用更改"
             )
             
-            # 添加键盘快捷键提示
-            st.markdown("""
-            <div style="font-size: 0.8em; color: #666; margin-top: -10px; margin-bottom: 10px;">
-                💡 <strong>提示:</strong> 修改文本后，统计信息会自动更新，点击下方「更新音频」按钮重新生成音频
-            </div>
-            """, unsafe_allow_html=True)
+            # 确保new_text不为None
+            if new_text is None:
+                new_text = ""
             
-            # 检查文本是否被修改
-            text_changed = new_text != current_text
-            if text_changed:
+            # 实时更新segment的final_text（但不影响用户正在编辑的文本）
+            if new_text != current_segment.final_text:
                 current_segment.update_final_text(new_text)
-                
-                # 实时更新统计信息
-                word_count = len(new_text.split())
-                char_count = len(new_text)
-                
-                # 显示更新后的统计信息（高亮显示）
-                current_rate = current_segment.speech_rate or 1.0
-                st.markdown(f"""
-                <div style="background-color: #e8f4fd; padding: 8px; border-radius: 4px; border-left: 4px solid #1f77b4;">
-                    <small><strong>📊 更新后统计:</strong> 词数: {word_count} | 字符: {char_count} | 当前语速: {current_rate:.2f}x | 时间: {current_segment.start:.1f}s - {current_segment.end:.1f}s</small>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # 计算文本长度变化提示
-                original_length = len(current_text)
-                new_length = len(new_text)
-                length_change = new_length - original_length
-                
-                if abs(length_change) > 50:  # 如果变化超过50个字符
-                    change_type = "增加" if length_change > 0 else "减少"
-                    st.warning(f"⚠️ 文本长度{change_type}了 {abs(length_change)} 个字符，可能影响时长匹配。建议重新生成音频检查效果。")
-                else:
-                    st.info("💡 文本已修改，点击下方「更新音频」按钮更新音频")
-            else:
-                # 显示原始统计信息
-                word_count = len(current_text.split())
-                char_count = len(current_text)
-                current_rate = current_segment.speech_rate or 1.0
-                st.caption(f"词数: {word_count} | 字符: {char_count} | 语速: {current_rate:.2f}x | 时间: {current_segment.start:.1f}s - {current_segment.end:.1f}s")
+            
+            # 显示统计信息
+            word_count = len(new_text.split()) if new_text else 0
+            char_count = len(new_text) if new_text else 0
+            current_rate = current_segment.speech_rate or 1.0
+            st.caption(f"词数: {word_count} | 字符: {char_count} | 语速: {current_rate:.2f}x | 时间: {current_segment.start:.1f}s - {current_segment.end:.1f}s")
             
             # 显示优化建议信息
+            original_text = current_segment.get_current_text()
+            text_changed = new_text != original_text
             if not text_changed:
                 self._display_optimization_suggestions(current_segment, current_index)
         
@@ -242,21 +252,15 @@ class AudioConfirmationView:
         col1, col2 = st.columns(2)
 
         with col1:
-            # 检查是否有文本修改，调整按钮样式
-            text_modified = current_segment.user_modified or (current_segment.get_current_text() != (current_segment.optimized_text or current_segment.translated_text or current_segment.original_text))
-            button_type = "primary" if text_modified else "secondary"
-            button_text = "🔄 更新音频" if text_modified else "🔄 重新生成音频"
-            button_help = "基于修改后的文本重新生成音频" if text_modified else "基于当前文本重新生成音频"
-
-            # 按钮宽度占满col
+            # 简化按钮逻辑，统一使用"重新生成音频"
             if st.button(
-                button_text,
+                "🔄 重新生成音频",
                 key=f"regenerate_{current_index}",
-                type=button_type,
-                help=button_help,
+                type="primary",
+                help="使用当前文本和语速设置重新生成音频",
                 use_container_width=True
             ):
-                self._regenerate_segment_audio(current_segment, target_lang)
+                self._regenerate_segment_audio(current_segment, target_lang, current_index)
 
         with col2:
             # 由于st.button的type只支持primary/secondary/tertiary，使用primary高亮确认按钮
@@ -279,16 +283,33 @@ class AudioConfirmationView:
                 ):
                     current_segment.confirmed = True
                     st.success("片段已确认！")
-                    # 跳转到下一个片段（如有）
-                    total_segments = st.session_state.get('total_confirmation_segments', None)
-                    if total_segments is None:
-                        # 兼容性处理
-                        total_segments = st.session_state.get('confirmation_segments_count', None)
-                    if total_segments is None:
-                        # 兜底方案
-                        total_segments = 1
-                    next_index = min(current_index + 1, total_segments - 1)
-                    st.session_state.current_confirmation_index = next_index
+                    
+                    # 智能跳转到下一个未确认的片段
+                    total_segments = len(confirmation_segments)
+                    next_unconfirmed_index = None
+                    
+                    # 从当前位置开始向后找未确认的片段
+                    for i in range(current_index + 1, total_segments):
+                        if not confirmation_segments[i].confirmed:
+                            next_unconfirmed_index = i
+                            break
+                    
+                    # 如果后面没有未确认的，从头开始找
+                    if next_unconfirmed_index is None:
+                        for i in range(0, current_index):
+                            if not confirmation_segments[i].confirmed:
+                                next_unconfirmed_index = i
+                                break
+                    
+                    # 设置跳转目标
+                    if next_unconfirmed_index is not None:
+                        st.session_state.current_confirmation_index = next_unconfirmed_index
+                        st.info(f"🎯 自动跳转到下一个未确认片段 {next_unconfirmed_index + 1}")
+                    else:
+                        # 所有片段都已确认，显示完成提示
+                        st.success("🎉 所有片段都已确认完成！")
+                        # 保持在当前位置
+                    
                     st.rerun()
         
         # 页面导航控件
@@ -389,206 +410,98 @@ class AudioConfirmationView:
                     st.markdown(f"- {suggestion}")
     
     def _display_speech_rate_control(self, segment: "SegmentDTO", segment_index: int):
-        """现代化语速控制UI组件"""
-        from typing import Any
+        """简洁的语速控制UI组件"""
         
-        # 使用自定义CSS美化界面
-        st.markdown("""
-        <style>
-        .speech-rate-container {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 1.5rem;
-            border-radius: 15px;
-            margin: 1rem 0;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-        }
-        .rate-display {
-            background: rgba(255,255,255,0.95);
-            padding: 1rem;
-            border-radius: 10px;
-            text-align: center;
-            margin: 0.5rem 0;
-        }
-        .rate-value {
-            font-size: 2rem;
-            font-weight: bold;
-            color: #2c3e50;
-        }
-        .rate-label {
-            color: #7f8c8d;
-            font-size: 0.9rem;
-        }
-        .optimize-button {
-            background: linear-gradient(45deg, #ff6b6b, #ee5a24);
-            border: none;
-            border-radius: 25px;
-            padding: 0.5rem 1.5rem;
-            color: white;
-            font-weight: bold;
-            transition: all 0.3s ease;
-        }
-        .optimize-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-        }
-        .slider-container {
-            background: rgba(255,255,255,0.9);
-            padding: 1.5rem;
-            border-radius: 12px;
-            margin: 1rem 0;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-
-        # 获取当前语速和时长信息
-        current_rate: float = segment.speech_rate or 1.0
+        # 获取固定的语速信息
+        current_rate: float = segment.speech_rate or 1.0  # 当前音频的语速，固定值
         target_duration: float = getattr(segment, "target_duration", 0) or 1.0
         actual_duration: float = getattr(segment, "actual_duration", 0)
 
-        # 计算理想语速（基于当前音频时长）
+        # 计算建议语速（基于当前音频时长），固定值
         if actual_duration > 0 and target_duration > 0:
             raw_optimal_rate: float = actual_duration / target_duration * current_rate
-            optimal_rate: float = max(0.95, min(1.15, raw_optimal_rate))
+            suggested_rate: float = max(0.95, min(1.15, raw_optimal_rate))
         else:
-            raw_optimal_rate = current_rate
-            optimal_rate = current_rate
+            suggested_rate = current_rate
 
-        # 检查是否有待应用的语速设置
-        pending_rate_key = f"pending_speech_rate_{segment_index}"
-        pending_rate = st.session_state.get(pending_rate_key, None)
+        # 用户调整的语速（用于下次重新生成音频）
+        slider_key = f"user_speech_rate_{segment_index}"
         
-        # 如果有待应用的语速，显示待应用状态
-        if pending_rate is not None:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(f"""
-                <div style="background: linear-gradient(45deg, #f39c12, #e67e22); 
-                            color: white; padding: 1rem; border-radius: 10px; 
-                            text-align: center; margin: 1rem 0;">
-                    <div style="font-size: 1.2rem; margin-bottom: 0.5rem;">
-                        ⏳ 待应用语速设置
-                    </div>
-                    <div style="font-size: 0.9rem;">
-                        目标语速: {pending_rate:.2f}x，请点击「更新音频」以应用
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            with col2:
-                if st.button("❌ 取消", key=f"cancel_pending_rate_{segment_index}", type="secondary"):
-                    del st.session_state[pending_rate_key]
-                    st.success("✅ 已取消待应用的语速设置")
-                    st.rerun()
+        # 检查是否需要重置语速滑块（比如点击了"使用建议"按钮）
+        reset_rate_key = f"reset_rate_{segment_index}"
+        suggested_rate_key = f"suggested_rate_{segment_index}"
+        
+        if st.session_state.get(reset_rate_key, False):
+            # 清除重置标记和旧的语速状态
+            if reset_rate_key in st.session_state:
+                del st.session_state[reset_rate_key]
+            if slider_key in st.session_state:
+                del st.session_state[slider_key]
+            
+            # 使用建议的语速值重新初始化
+            suggested_value = st.session_state.get(suggested_rate_key, current_rate)
+            st.session_state[slider_key] = suggested_value
+            
+            # 清除建议语速缓存
+            if suggested_rate_key in st.session_state:
+                del st.session_state[suggested_rate_key]
+        
+        # 初始化语速状态（如果不存在）
+        if slider_key not in st.session_state:
+            st.session_state[slider_key] = current_rate
+        
+        user_rate = st.session_state[slider_key]
 
-        # 现代化布局
-        col1, col2 = st.columns([3, 2], gap="large")
+        # 简洁布局
+        col1, col2, col3 = st.columns([1, 1, 2])
 
         with col1:
-            # 语速调节滑块区域         
-            # 当前语速显示
             st.markdown(f"""
-            <div class="rate-display">
-                <div class="rate-value">{current_rate:.2f}x</div>
-                <div class="rate-label">当前语速</div>
+            <div style="text-align: center; padding: 0.8rem; background: #f8f9fa; border-radius: 8px;">
+                <div style="font-size: 1.5rem; font-weight: bold; color: #2c3e50;">{current_rate:.2f}x</div>
+                <div style="font-size: 0.8rem; color: #6c757d;">当前语速</div>
             </div>
             """, unsafe_allow_html=True)
-            
-            # 语速滑块 - 使用待应用语速或当前语速作为初始值
-            slider_value = pending_rate if pending_rate is not None else current_rate
-            new_rate: float = st.slider(
-                "调整语速倍率",
-                min_value=0.95,
-                max_value=1.15,
-                value=round(slider_value, 2),
-                step=0.01,
-                key=f"speech_rate_{segment_index}",
-                help="拖动滑块调整语音播放速度，1.00为正常语速"
-            )
-            
-            # 手动调整滑块时，立即更新segment（这是用户主动调整）
-            if abs(new_rate - current_rate) > 0.01 and pending_rate is None:
-                segment.speech_rate = new_rate
-                # 重新估算时长误差
-                if actual_duration > 0:
-                    estimated_new_duration = actual_duration * (current_rate / new_rate)
-                    new_error = abs(estimated_new_duration - target_duration) * 1000
-                    segment.timing_error_ms = new_error
 
         with col2:
-            # 智能建议区域         
-            # 建议语速显示
-            if abs(optimal_rate - current_rate) > 0.02:
-                delta_val = optimal_rate - current_rate
-                delta_icon = "⬆️" if delta_val > 0 else "⬇️"
-                delta_color = "#e74c3c" if delta_val > 0 else "#27ae60"
-                
+            if abs(suggested_rate - current_rate) > 0.02:
+                color = "#e74c3c" if suggested_rate > current_rate else "#27ae60"
                 st.markdown(f"""
-                <div class="rate-display">
-                    <div class="rate-value" style="color: {delta_color};">{optimal_rate:.2f}x</div>
-                    <div class="rate-label">建议语速 {delta_icon}</div>
+                <div style="text-align: center; padding: 0.8rem; background: #f8f9fa; border-radius: 8px;">
+                    <div style="font-size: 1.5rem; font-weight: bold; color: {color};">{suggested_rate:.2f}x</div>
+                    <div style="font-size: 0.8rem; color: #6c757d;">建议语速</div>
                 </div>
                 """, unsafe_allow_html=True)
-                
-                # 建议说明
-                if actual_duration > 0 and target_duration > 0:
-                    if raw_optimal_rate < 0.95 or raw_optimal_rate > 1.15:
-                        st.warning(f"⚠️ 理想语速 {raw_optimal_rate:.2f}x 超出推荐范围")
-                    else:
-                        st.info(f"💡 根据时长自动推荐，调整幅度: {abs(delta_val):.2f}x")
-                else:
-                    st.info("💡 缺少时长数据，建议先生成音频")
             else:
-                st.success("✅ 当前语速已接近最优，无需调整")
+                st.markdown(f"""
+                <div style="text-align: center; padding: 0.8rem; background: #d4edda; border-radius: 8px;">
+                    <div style="font-size: 1.5rem; font-weight: bold; color: #155724;">最优</div>
+                    <div style="font-size: 0.8rem; color: #155724;">无需调整</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-            # 一键优化按钮
-            rate_out_of_bounds: bool = raw_optimal_rate < 0.95 or raw_optimal_rate > 1.15
-            button_disabled: bool = abs(optimal_rate - current_rate) < 0.02
-
-            if rate_out_of_bounds:
-                button_text = "⚠️ 需调文本"
-                button_help = "理想语速超出推荐范围，建议优先调整文本长度"
-                button_color = "secondary"
-            else:
-                button_text = "🎯 应用建议"
-                button_help = "一键应用推荐语速"
-                button_color = "primary"
-
-            if st.button(
-                button_text,
-                key=f"apply_optimal_rate_{segment_index}",
-                disabled=button_disabled,
-                help=button_help,
-                type=button_color
-            ):
-                if not rate_out_of_bounds:
-                    # 将建议语速存储为待应用状态，而不是立即更新segment
-                    st.session_state[pending_rate_key] = optimal_rate
-                    st.success(f"✅ 已设置建议语速: {optimal_rate:.2f}x（待应用）")
-                    st.rerun()
-                else:
-                    if raw_optimal_rate < 0.95:
-                        st.warning(f"⚠️ 理想语速 {raw_optimal_rate:.2f}x 低于下限，建议增加文本长度")
-                    else:
-                        st.warning(f"⚠️ 理想语速 {raw_optimal_rate:.2f}x 高于上限，建议减少文本长度")
-
-        # 语速变化提示 - 使用更美观的提示
-        if abs(new_rate - current_rate) > 0.01 and pending_rate is None:
-            rate_change = new_rate - current_rate
-            change_type = "加速" if rate_change > 0 else "减速"
-            change_icon = "🚀" if rate_change > 0 else "🐌"
+        with col3:
+            # 语速调节滑块
+            new_rate = st.slider(
+                "下次生成语速",
+                min_value=0.95,
+                max_value=1.15,
+                value=user_rate,
+                step=0.01,
+                key=slider_key,
+                help="调整下次重新生成音频时使用的语速"
+            )
             
-            st.markdown(f"""
-            <div style="background: linear-gradient(45deg, #3498db, #2980b9); 
-                        color: white; padding: 1rem; border-radius: 10px; 
-                        text-align: center; margin: 1rem 0;">
-                <div style="font-size: 1.2rem; margin-bottom: 0.5rem;">
-                    {change_icon} 语速已调整
-                </div>
-                <div style="font-size: 0.9rem;">
-                    {change_type} {abs(rate_change):.2f}x，请点击「更新音频」以应用新语速
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            # 快速设置按钮
+            if abs(suggested_rate - current_rate) > 0.02 and abs(suggested_rate - user_rate) > 0.01:
+                if st.button(f"使用建议 {suggested_rate:.2f}x", key=f"use_suggested_{segment_index}", type="secondary"):
+                    # 使用重置机制，避免直接修改widget的session_state
+                    reset_rate_key = f"reset_rate_{segment_index}"
+                    suggested_rate_key = f"suggested_rate_{segment_index}"
+                    st.session_state[reset_rate_key] = True
+                    st.session_state[suggested_rate_key] = suggested_rate
+                    st.success(f"✅ 已设置语速为 {suggested_rate:.2f}x")
+                    st.rerun()
     
     
     def _display_audio_preview(self, segment: SegmentDTO, segment_index: int):
@@ -651,7 +564,7 @@ class AudioConfirmationView:
             st.warning("⚠️ 音频数据不可用")
 
     
-    def _regenerate_segment_audio(self, segment: SegmentDTO, target_lang: str):
+    def _regenerate_segment_audio(self, segment: SegmentDTO, target_lang: str, segment_index: int):
         """重新生成片段音频"""
         try:
             # 从session_state获取TTS实例
@@ -662,34 +575,21 @@ class AudioConfirmationView:
                 tts = AzureTTS(config)
                 st.session_state['tts'] = tts
             
-            # 获取用户修改后的文本
-            current_text = segment.get_current_text()
+            # 获取用户在文本框中输入的最新文本
+            text_key = f"text_edit_{segment.id}"
+            current_text = st.session_state.get(text_key, segment.get_current_text())
+            logger.info(f"重新生成音频 - 片段 {segment.id}: session_state文本='{current_text[:50]}...', segment文本='{segment.get_current_text()[:50]}...'")
+            
             if not current_text.strip():
                 st.error("❌ 文本内容为空，无法生成音频")
                 return
             
-            # 检查是否有待应用的语速设置
-            pending_rate_key = f"pending_speech_rate_{segment.id}"
-            pending_rate = st.session_state.get(pending_rate_key, None)
+            # 获取用户设定的语速
+            user_rate_key = f"user_speech_rate_{segment_index}"
+            user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             
             # 显示生成进度
             with st.spinner(f"🔄 正在重新生成片段 {segment.id} 的音频..."):
-                # 优先使用待应用的语速设置
-                if pending_rate is not None:
-                    optimal_rate = pending_rate
-                    st.info(f"🎯 应用待设置语速: {optimal_rate:.2f}x")
-                    # 清除待应用状态
-                    del st.session_state[pending_rate_key]
-                elif hasattr(segment, 'speech_rate') and segment.speech_rate:
-                    optimal_rate = segment.speech_rate
-                    st.info(f"🎛️ 使用用户设定语速: {optimal_rate:.2f}x")
-                else:
-                    # 估算最优语速以匹配目标时长
-                    optimal_rate = tts.estimate_optimal_speech_rate(
-                        current_text, target_lang, segment.target_duration
-                    )
-                    st.info(f"🤖 使用系统估算语速: {optimal_rate:.2f}x")
-                
                 # 生成新音频
                 voice_name = tts.voice_map.get(target_lang)
                 if not voice_name:
@@ -699,13 +599,20 @@ class AudioConfirmationView:
                 new_audio_data = tts._generate_single_audio(
                     current_text,
                     voice_name,
-                    optimal_rate,
+                    user_rate,
                     segment.target_duration
                 )
                 
                 # 更新片段信息
                 segment.set_audio_data(new_audio_data)
-                segment.speech_rate = optimal_rate
+                segment.speech_rate = user_rate
+                # 确保将用户修改的文本保存到segment中
+                segment.update_final_text(current_text)
+                
+                # 设置重置标记，让下次渲染时重新初始化文本框
+                reset_key = f"reset_text_{segment.id}"
+                st.session_state[reset_key] = True
+                logger.info(f"音频重新生成完成 - 片段 {segment.id}: 已更新segment.final_text，将重置文本框")
                 
                 # 计算新的时长误差
                 if segment.actual_duration:
@@ -725,7 +632,7 @@ class AudioConfirmationView:
                 
                 # 更新校准因子（提升未来估算精度）
                 estimated_duration = tts.estimate_audio_duration_optimized(
-                    current_text, target_lang, optimal_rate
+                    current_text, target_lang, user_rate
                 )
                 if segment.actual_duration is not None:
                     tts.update_calibration(target_lang, estimated_duration, segment.actual_duration)
@@ -734,32 +641,11 @@ class AudioConfirmationView:
                 if current_text != segment.optimized_text:
                     segment.user_modified = True
                 
-                # 确保语速保存到segment中
-                segment.speech_rate = optimal_rate
-                
                 logger.info(f"片段 {segment.id} 音频重新生成成功: "
-                          f"时长={segment.actual_duration:.2f}s, 语速={optimal_rate:.3f}, "
+                          f"时长={segment.actual_duration:.2f}s, 语速={user_rate:.3f}, "
                           f"误差={segment.timing_error_ms:.0f}ms, 质量={segment.quality}")
                 
-                # 根据语速来源显示不同的成功消息
-                if pending_rate is not None:
-                    st.success(f"✅ 片段 {segment.id} 音频重新生成成功！(已应用建议语速: {optimal_rate:.2f}x)")
-                elif hasattr(segment, 'speech_rate') and segment.speech_rate == optimal_rate:
-                    st.success(f"✅ 片段 {segment.id} 音频重新生成成功！(使用用户设定语速)")
-                else:
-                    st.success(f"✅ 片段 {segment.id} 音频重新生成成功！(使用系统估算语速)")
-                
-                # 显示更新后的统计信息
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("新实际时长", f"{segment.actual_duration:.2f}s")
-                with col2:
-                    st.metric("使用语速", f"{optimal_rate:.2f}x")
-                with col3:
-                    st.metric("时长误差", f"{segment.timing_error_ms:.0f}ms")
-                with col4:
-                    sync_ratio = segment.sync_ratio
-                    st.metric("同步比例", f"{sync_ratio:.2f}")
+                st.success(f"✅ 音频重新生成成功！语速: {user_rate:.2f}x")
                 
                 # 自动刷新页面以显示更新后的音频和指标
                 st.rerun()
@@ -769,20 +655,14 @@ class AudioConfirmationView:
             logger.error(error_msg)
             st.error(f"❌ {error_msg}")
             
-            # 如果失败，清除待应用的语速设置
-            pending_rate_key = f"pending_speech_rate_{segment.id}"
-            if pending_rate_key in st.session_state:
-                del st.session_state[pending_rate_key]
-            
             # 提供详细的错误信息和解决建议
-            with st.expander("🔍 错误详情和解决建议"):
+            with st.expander("🔍 错误详情"):
                 st.code(str(e))
                 st.write("**可能的解决方案:**")
                 st.write("1. 检查网络连接和Azure TTS服务状态")
                 st.write("2. 验证API密钥是否有效且有足够配额")
                 st.write("3. 检查文本长度是否合理（建议少于500字符）")
                 st.write("4. 尝试稍后重试，可能是服务临时不可用")
-                st.write("5. 如果问题持续，请联系技术支持")
     
     def _show_segment_analysis(self, segment: SegmentDTO):
         """显示片段分析详情"""
@@ -893,9 +773,9 @@ class AudioConfirmationView:
                 st.success("🎉 所有片段已确认完成！可以生成最终音频了。")
     
     def _render_action_buttons(self, confirmation_segments: List[SegmentDTO],
-                              translated_original_segments: List[SegmentDTO],
-                              optimized_segments: List[SegmentDTO],
-                              target_lang: str) -> Dict[str, Any]:
+                               translated_original_segments: List[SegmentDTO],
+                               optimized_segments: List[SegmentDTO],
+        target_lang: str) -> Dict[str, Any]:
         """渲染操作按钮"""
         st.markdown("---")
         st.subheader("🎬 最终操作")

@@ -3,10 +3,11 @@
 负责根据优化后的片段生成音频，并提供用户确认功能
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from loguru import logger
 from pydub import AudioSegment
 import time
+from models.segment_dto import SegmentDTO
 
 
 class AudioSynthesizer:
@@ -35,28 +36,46 @@ class AudioSynthesizer:
             self.progress_callback(current, total, message)
         logger.info(f"进度: {current}/{total} - {message}")
     
-    def generate_audio_for_confirmation(self, optimized_segments: List[Dict], tts, target_language: str) -> List[Dict]:
+    def generate_audio_for_confirmation(self, segments: Union[List[SegmentDTO], List[Dict]], tts, target_language: str) -> List[Dict]:
         """
         为每个优化后的片段并发生成音频，供用户确认
         
         Args:
-            optimized_segments: 优化后的片段列表
+            segments: 片段列表（支持SegmentDTO或字典格式）
             tts: TTS实例
             target_language: 目标语言
             
         Returns:
-            包含音频数据的片段列表，供用户确认
+            包含音频数据的确认数据列表
         """
-        logger.info(f"开始并发为 {len(optimized_segments)} 个片段生成音频")
+        # 转换为统一的SegmentDTO格式
+        segment_dtos = self._normalize_segments(segments)
+        logger.info(f"开始并发为 {len(segment_dtos)} 个片段生成音频")
         
-        return self._generate_confirmation_audio_concurrent(optimized_segments, tts, target_language)
+        return self._generate_confirmation_audio_concurrent(segment_dtos, tts, target_language)
     
-    def _generate_confirmation_audio_concurrent(self, optimized_segments: List[Dict], tts, target_language: str) -> List[Dict]:
+    def _normalize_segments(self, segments: Union[List[SegmentDTO], List[Dict]]) -> List[SegmentDTO]:
+        """将输入片段标准化为SegmentDTO格式"""
+        normalized = []
+        
+        for segment in segments:
+            if isinstance(segment, SegmentDTO):
+                normalized.append(segment)
+            elif isinstance(segment, dict):
+                # 从字典转换为SegmentDTO
+                normalized.append(SegmentDTO.from_legacy_segment(segment))
+            else:
+                logger.warning(f"未知的segment类型: {type(segment)}")
+                continue
+        
+        return normalized
+    
+    def _generate_confirmation_audio_concurrent(self, segments: List[SegmentDTO], tts, target_language: str) -> List[Dict]:
         """
         并发生成确认音频
         
         Args:
-            optimized_segments: 优化后的片段列表
+            segments: SegmentDTO片段列表
             tts: TTS实例
             target_language: 目标语言
             
@@ -67,66 +86,65 @@ class AudioSynthesizer:
         import threading
         
         # 控制并发数
-        max_workers = min(6, len(optimized_segments), max(2, len(optimized_segments) // 4))
+        max_workers = min(6, len(segments), max(2, len(segments) // 4))
         
         results_lock = threading.Lock()
         completed_count = 0
         
-        logger.info(f"启动并发确认音频生成: {max_workers}个worker处理{len(optimized_segments)}个片段")
+        logger.info(f"启动并发确认音频生成: {max_workers}个worker处理{len(segments)}个片段")
         
-        def generate_confirmation_segment(segment: Dict, index: int) -> Tuple[int, Dict]:
+        def generate_confirmation_segment(segment: SegmentDTO, index: int) -> Tuple[int, Dict]:
             """生成单个确认片段"""
             try:
                 # 生成音频
                 raw_audio_data = self._generate_single_audio(
-                    segment.get('final_text', segment.get('text', '')), 
-                    segment.get('speech_rate', 1.0), 
+                    segment.get_current_text(), 
+                    segment.speech_rate, 
                     tts, 
                     target_language
                 )
                 
                 # 在确认阶段就进行音频截断处理
-                target_duration = segment.get('target_duration', 0.0)
-                processed_audio_data = self._process_audio_for_confirmation(raw_audio_data, target_duration)
+                processed_audio_data = self._process_audio_for_confirmation(raw_audio_data, segment.target_duration)
                 
                 # 构建确认数据
                 confirmation_data = {
-                    'segment_id': segment.get('id', index+1),
-                    'original_text': segment.get('original_text', segment.get('text', '')),
-                    'final_text': segment.get('final_text', segment.get('text', '')),
-                    'target_duration': target_duration,
-                    'estimated_duration': segment.get('estimated_duration', 0.0),
+                    'segment_id': segment.id,
+                    'original_text': segment.original_text,
+                    'final_text': segment.get_current_text(),
+                    'target_duration': segment.target_duration,
+                    'estimated_duration': segment.actual_duration or 0.0,
                     'actual_duration': len(processed_audio_data) / 1000.0,
-                    'raw_audio_duration': len(raw_audio_data) / 1000.0,  # 原始音频时长
-                    'timing_error_ms': abs(len(processed_audio_data) / 1000.0 - target_duration) * 1000,
-                    'speech_rate': segment.get('speech_rate', 1.0),
-                    'quality': segment.get('quality', 'unknown'),
-                    'audio_data': processed_audio_data,  # 使用处理后的音频
-                    'raw_audio_data': raw_audio_data,  # 保留原始音频用于对比
-                    'segment_data': segment,  # 完整片段数据
-                    'confirmed': False,  # 用户确认状态
-                    'text_modified': False,  # 文本是否被修改
-                    'user_modified_text': None,  # 用户修改的文本
-                    'is_truncated': len(raw_audio_data) > target_duration * 1000 + 100  # 是否被截断（允许100ms误差）
+                    'raw_audio_duration': len(raw_audio_data) / 1000.0,
+                    'timing_error_ms': abs(len(processed_audio_data) / 1000.0 - segment.target_duration) * 1000,
+                    'speech_rate': segment.speech_rate,
+                    'quality': segment.quality or 'unknown',
+                    'audio_data': processed_audio_data,
+                    'raw_audio_data': raw_audio_data,
+                    'segment_data': segment.to_legacy_dict(),
+                    'confirmed': segment.confirmed,
+                    'text_modified': False,
+                    'user_modified_text': None,
+                    'is_truncated': len(raw_audio_data) > segment.target_duration * 1000 + 100
                 }
                 
                 return index, confirmation_data
                 
             except Exception as e:
-                logger.error(f"并发生成片段 {segment.get('id', index+1)} 确认音频失败: {e}")
+                logger.error(f"并发生成片段 {segment.id} 确认音频失败: {e}")
                 # 创建错误确认数据
                 error_data = {
-                    'segment_id': segment.get('id', index+1),
-                    'original_text': segment.get('original_text', segment.get('text', '')),
-                    'final_text': segment.get('final_text', ''),
-                    'target_duration': segment.get('target_duration', 0.0),
-                    'estimated_duration': segment.get('estimated_duration', 0.0),
+                    'segment_id': segment.id,
+                    'original_text': segment.original_text,
+                    'final_text': segment.get_current_text(),
+                    'target_duration': segment.target_duration,
+                    'estimated_duration': segment.actual_duration or 0.0,
                     'actual_duration': 0,
-                    'timing_error_ms': segment.get('timing_error_ms', 0),
-                    'speech_rate': segment.get('speech_rate', 1.0),
+                    'timing_error_ms': segment.timing_error_ms or 0,
+                    'speech_rate': segment.speech_rate,
                     'quality': 'error',
                     'audio_data': None,
-                    'segment_data': segment,
+                    'segment_data': segment.to_legacy_dict(),
                     'confirmed': False,
                     'text_modified': False,
                     'user_modified_text': None,
@@ -138,7 +156,7 @@ class AudioSynthesizer:
             # 提交所有任务
             future_to_index = {
                 executor.submit(generate_confirmation_segment, segment, i): i
-                for i, segment in enumerate(optimized_segments)
+                for i, segment in enumerate(segments)
             }
             
             # 收集结果
@@ -152,24 +170,25 @@ class AudioSynthesizer:
                     # 线程安全的进度报告
                     with results_lock:
                         completed_count += 1
-                        self._report_progress(completed_count, len(optimized_segments), 
-                                            f"生成确认音频: {completed_count}/{len(optimized_segments)} (并发)")
+                        self._report_progress(completed_count, len(segments), 
+                                            f"生成确认音频: {completed_count}/{len(segments)} (并发)")
                         
                 except Exception as e:
                     logger.error(f"获取并发确认结果异常 {index}: {e}")
                     # 创建默认错误数据
+                    segment = segments[index]
                     error_data = {
-                        'segment_id': optimized_segments[index].get('id', index+1),
-                        'original_text': optimized_segments[index].get('original_text', segment.get('text', '')),
-                        'final_text': optimized_segments[index].get('final_text', ''),
-                        'target_duration': optimized_segments[index].get('target_duration', 0.0),
-                        'estimated_duration': optimized_segments[index].get('estimated_duration', 0.0),
+                        'segment_id': segment.id,
+                        'original_text': segment.original_text,
+                        'final_text': segment.get_current_text(),
+                        'target_duration': segment.target_duration,
+                        'estimated_duration': segment.actual_duration or 0.0,
                         'actual_duration': 0,
-                        'timing_error_ms': optimized_segments[index].get('timing_error_ms', 0),
-                        'speech_rate': optimized_segments[index].get('speech_rate', 1.0),
+                        'timing_error_ms': segment.timing_error_ms or 0,
+                        'speech_rate': segment.speech_rate,
                         'quality': 'error',
                         'audio_data': None,
-                        'segment_data': optimized_segments[index],
+                        'segment_data': segment.to_legacy_dict(),
                         'confirmed': False,
                         'text_modified': False,
                         'user_modified_text': None,
@@ -178,10 +197,10 @@ class AudioSynthesizer:
                     indexed_results[index] = error_data
             
             # 按原始顺序组织结果
-            confirmation_segments = [indexed_results[i] for i in range(len(optimized_segments))]
+            confirmation_segments = [indexed_results[i] for i in range(len(segments))]
         
         success_count = len([seg for seg in confirmation_segments if seg.get('audio_data') is not None])
-        logger.info(f"并发确认音频生成完成: {success_count}/{len(optimized_segments)} 成功")
+        logger.info(f"并发确认音频生成完成: {success_count}/{len(segments)} 成功")
         
         return confirmation_segments
     
@@ -240,28 +259,27 @@ class AudioSynthesizer:
             # 计算淡出长度（最后100ms进行淡出，避免突然中断）
             fade_out_duration = min(100, target_duration_ms // 10)  # 淡出时长不超过目标时长的10%
             
-            # 截断到目标时长
-            truncated_audio = audio_segment[:target_duration_ms]
+            # 截断到目标时长 - 使用pydub标准切片方法
+            if len(audio_segment) > target_duration_ms:
+                # 使用pydub的标准切片方法截断音频
+                truncated_audio = audio_segment[:target_duration_ms]  # type: ignore
+            else:
+                truncated_audio = audio_segment
             
             # 应用淡出效果，让截断更自然
-            if fade_out_duration > 0 and len(truncated_audio) > fade_out_duration:
+            if fade_out_duration > 0 and len(truncated_audio) > fade_out_duration:  # type: ignore
                 # 在最后的淡出区间应用淡出效果
-                fade_start = len(truncated_audio) - fade_out_duration
-                processed_audio = truncated_audio.fade_out(fade_out_duration)
+                processed_audio = truncated_audio.fade_out(fade_out_duration)  # type: ignore
             else:
                 processed_audio = truncated_audio
             
-            logger.debug(f"音频截断完成: {current_duration_ms}ms -> {len(processed_audio)}ms (淡出: {fade_out_duration}ms)")
-            return processed_audio
+            logger.debug(f"音频截断完成: {current_duration_ms}ms -> {len(processed_audio)}ms (淡出: {fade_out_duration}ms)")  # type: ignore
+            return processed_audio  # type: ignore
             
         except Exception as e:
             logger.error(f"音频处理失败: {e}")
-            # 降级方案：简单截断
-            try:
-                target_duration_ms = int(target_duration * 1000)
-                return audio_segment[:target_duration_ms]
-            except:
-                return audio_segment
+            # 降级方案：返回原音频
+            return audio_segment
     
     def regenerate_audio_with_modified_text(self, confirmation_data: Dict, tts, target_language: str) -> Dict:
         """
@@ -337,11 +355,26 @@ class AudioSynthesizer:
                 logger.warning("没有音频片段可合并")
                 return AudioSegment.silent(duration=1000)
             
+            # 添加详细的调试日志
+            logger.info(f"开始过滤确认片段，总数: {len(confirmed_segments)}")
+            for i, seg in enumerate(confirmed_segments):
+                confirmed = seg.get('confirmed', False)
+                has_audio = seg.get('audio_data') is not None
+                seg_id = seg.get('id', seg.get('segment_id', f'seg_{i}'))
+                quality = seg.get('quality', 'unknown')
+                timing_error = seg.get('timing_error_ms', 0)
+                user_modified = seg.get('user_modified', seg.get('text_modified', False))
+                
+                logger.debug(f"片段 {seg_id}: confirmed={confirmed}, has_audio={has_audio}, "
+                           f"quality={quality}, timing_error={timing_error}ms, user_modified={user_modified}")
+            
             # 过滤出已确认且有音频数据的片段
             valid_segments = [
                 seg for seg in confirmed_segments 
                 if seg.get('confirmed', False) and seg.get('audio_data') is not None
             ]
+            
+            logger.info(f"过滤后有效片段数: {len(valid_segments)}")
             
             if not valid_segments:
                 logger.warning("没有有效的音频片段")

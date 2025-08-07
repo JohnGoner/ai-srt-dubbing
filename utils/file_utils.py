@@ -154,7 +154,7 @@ def clean_filename(filename: str) -> str:
     return cleaned
 
 
-def backup_file(file_path: str, backup_dir: str = None) -> Optional[str]:
+def backup_file(file_path: str, backup_dir: Optional[str] = None) -> Optional[str]:
     """
     备份文件
     
@@ -345,7 +345,7 @@ def get_file_hash(file_path: str) -> Optional[str]:
         return None 
 
 
-def select_file_interactive(file_types: List[Tuple[str, str]] = None, title: str = "选择文件") -> Optional[str]:
+def select_file_interactive(file_types: Optional[List[Tuple[str, str]]] = None, title: str = "选择文件") -> Optional[str]:
     """
     交互式文件选择器
     
@@ -447,7 +447,7 @@ def select_file_commandline() -> Optional[str]:
         return None
 
 
-def browse_directory_for_srt(directory: str = None) -> Optional[str]:
+def browse_directory_for_srt(directory: Optional[str] = None) -> Optional[str]:
     """
     浏览目录选择SRT文件
     
@@ -638,7 +638,7 @@ def save_recent_file(file_path: str) -> None:
         logger.error(f"保存最近文件失败: {str(e)}")
 
 
-def find_srt_files_in_directory(directory: str = None, max_files: int = 10) -> List[str]:
+def find_srt_files_in_directory(directory: Optional[str] = None, max_files: int = 10) -> List[str]:
     """
     在指定目录中查找SRT文件
     

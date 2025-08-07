@@ -396,7 +396,9 @@ def reset_all_states():
         'confirmed_segments', 'target_lang', 'config', 'input_file_path',
         'completion_results', 'optimized_segments', 'confirmation_segments',
         'translated_original_segments', 'translated_segments', 'validated_segments',
-        'current_confirmation_index', 'confirmation_page', 'user_adjustment_choices'
+        'current_confirmation_index', 'confirmation_page', 'user_adjustment_choices',
+        # 分段视图的session_state
+        'segmentation_edited_segments', 'segmentation_current_page', 'segmentation_original_segments'
         # 'selected_cache'  # 注释掉cache相关
     ]
     

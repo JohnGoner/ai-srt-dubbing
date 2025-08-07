@@ -7,13 +7,4 @@
 from .subtitle_processor import SubtitleProcessor
 from .subtitle_segmenter import SubtitleSegmenter
 
-__all__ = ['SubtitleProcessor', 'SubtitleSegmenter']
-
-# 延迟导入（避免启动时的依赖问题）
-def get_audio_extractor():
-    """获取音频提取器（延迟导入）"""
-    try:
-        from .audio_extractor import AudioExtractor
-        return AudioExtractor
-    except ImportError as e:
-        raise ImportError(f"音频提取功能需要额外的依赖包") from e 
+__all__ = ['SubtitleProcessor', 'SubtitleSegmenter'] 

@@ -788,7 +788,7 @@ class PreciseSyncManager:
             self._report_progress(i + 1, total_segments, f"应用调整片段 {segment.get('id', i+1)}")
             
             segment_id = segment.get('id')
-            adjustment_choice = adjustment_choices.get(segment_id)
+            adjustment_choice = adjustment_choices.get(segment_id) if segment_id is not None else None
             
             try:
                 if adjustment_choice:

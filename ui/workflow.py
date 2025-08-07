@@ -268,6 +268,12 @@ class WorkflowManager:
             # 保存分段缓存
             # self._save_segmentation_cache(session_data, confirmed_segments)  # 注释掉cache相关
             
+            # 清理分段视图的session_state，因为已经确认完成
+            segmentation_keys = ['segmentation_edited_segments', 'segmentation_current_page', 'segmentation_original_segments']
+            for key in segmentation_keys:
+                if key in st.session_state:
+                    del st.session_state[key]
+            
             # 进入下一阶段
             session_data['processing_stage'] = 'language_selection'
             
@@ -276,6 +282,12 @@ class WorkflowManager:
             keys_to_reset = ['processing_stage', 'segments', 'segmented_segments']
             for key in keys_to_reset:
                 session_data.pop(key, None)
+            
+            # 清理分段视图的session_state
+            segmentation_keys = ['segmentation_edited_segments', 'segmentation_current_page', 'segmentation_original_segments']
+            for key in segmentation_keys:
+                if key in st.session_state:
+                    del st.session_state[key]
         
         return session_data
     
@@ -318,6 +330,9 @@ class WorkflowManager:
                 
                 from translation.translator import Translator
                 translator = Translator(self.config)
+                
+                # 保存translator实例到session_data以便后续统计
+                session_data['translator_instance'] = translator
                 
                 # 转换为legacy格式进行翻译
                 legacy_segments = [seg.to_legacy_dict() for seg in confirmed_segments]
@@ -378,8 +393,16 @@ class WorkflowManager:
                 from tts.azure_tts import AzureTTS
                 
                 sync_manager = PreciseSyncManager(self.config, progress_callback=None)
-                translator = Translator(self.config)
+                
+                # 优先使用已有的translator实例以保持统计连续性
+                translator = session_data.get('translator_instance')
+                if not translator:
+                    translator = Translator(self.config)
+                    session_data['translator_instance'] = translator
+                
                 tts = AzureTTS(self.config)
+                # 保存tts实例以便后续统计
+                session_data['tts_instance'] = tts
                 
                 # 转换为legacy格式进行处理
                 legacy_segments = [seg.to_legacy_dict() for seg in validated_segments]
@@ -500,9 +523,26 @@ class WorkflowManager:
             translated_original_segments, target_lang, self.config
         )
         
+        # 确保用户修改后的confirmation_segments被保存到session_data中
+        session_data['confirmation_segments'] = confirmation_segments
+        
         if result['action'] == 'generate_final':
+            # 添加调试日志，检查确认后的segments数据
+            confirmed_segments = result['confirmed_segments']
+            logger.info(f"准备生成最终音频，确认片段数量: {len(confirmed_segments)}")
+            
+            # 详细记录每个片段的状态
+            for i, seg in enumerate(confirmed_segments):
+                logger.debug(f"确认片段 {i+1}/{len(confirmed_segments)}: "
+                           f"id={seg.id}, confirmed={seg.confirmed}, "
+                           f"user_modified={seg.user_modified}, "
+                           f"final_text='{seg.final_text[:50]}...', "
+                           f"quality={seg.quality}, "
+                           f"timing_error_ms={seg.timing_error_ms}, "
+                           f"has_audio={seg.audio_data is not None}")
+            
             # 生成最终音频
-            self._generate_final_audio(result['confirmed_segments'], session_data)
+            self._generate_final_audio(confirmed_segments, session_data)
             session_data['processing_stage'] = 'completion'
             logger.info(f"✅ 最终音频生成完成")
             # 返回数据而不是立即rerun，让数据先被保存
@@ -535,6 +575,12 @@ class WorkflowManager:
         if result['action'] == 'restart':
             self._reset_all_states(session_data)
             logger.info("🔄 用户选择重新开始")
+            # 返回数据而不是立即rerun，让数据先被保存
+            return session_data
+        elif result['action'] == 'back_to_audio_confirmation':
+            # 返回音频确认页面
+            session_data['processing_stage'] = 'user_confirmation'
+            logger.info("🔙 用户选择返回音频确认页面")
             # 返回数据而不是立即rerun，让数据先被保存
             return session_data
         
@@ -672,7 +718,7 @@ class WorkflowManager:
     #         logger.warning(f"保存翻译缓存失败: {e}")
     
     def _redistribute_translations(self, translated_segments: List[SegmentDTO], 
-                                  original_segments: List[SegmentDTO]) -> List[SegmentDTO]:
+        original_segments: List[SegmentDTO]) -> List[SegmentDTO]:
         """将翻译重新分配到原始时间分割上"""
         # 简化的重分配逻辑，避免依赖不存在的模块
         redistributed = []
@@ -696,7 +742,13 @@ class WorkflowManager:
             from tts.azure_tts import AzureTTS
             
             audio_synthesizer = AudioSynthesizer(self.config)
-            tts = AzureTTS(self.config)
+            
+            # 优先使用已保存的tts实例以保持统计连续性
+            tts = session_data.get('tts_instance')
+            if not tts:
+                tts = AzureTTS(self.config)
+                session_data['tts_instance'] = tts
+            
             target_lang = session_data.get('target_lang', 'en')
             
             # 转换为legacy格式
@@ -714,11 +766,37 @@ class WorkflowManager:
             # 保存字幕
             from audio_processor.subtitle_processor import SubtitleProcessor
             subtitle_processor = SubtitleProcessor(self.config)
-            translated_original = session_data.get('translated_original_segments', [])
-            subtitle_processor.save_subtitle(
-                [seg.to_legacy_dict() for seg in translated_original], 
-                subtitle_output, 'srt'
-            )
+            
+            # 添加详细调试日志
+            logger.info(f"准备保存字幕，确认片段数量: {len(confirmed_segments)}")
+            
+            # 记录每个片段的详细信息
+            for i, seg in enumerate(confirmed_segments):
+                logger.info(f"最终片段 {i+1}/{len(confirmed_segments)}: "
+                           f"id={seg.id}, confirmed={seg.confirmed}, "
+                           f"user_modified={seg.user_modified}, "
+                           f"quality={seg.quality}, "
+                           f"timing_error_ms={seg.timing_error_ms}, "
+                           f"speech_rate={seg.speech_rate}, "
+                           f"actual_duration={seg.actual_duration}, "
+                           f"target_duration={seg.target_duration}")
+                logger.debug(f"  final_text='{seg.final_text[:100]}...'")
+                logger.debug(f"  optimized_text='{(seg.optimized_text or '')[:100]}...'")
+                logger.debug(f"  has_audio_data={seg.audio_data is not None}")
+            
+            # 使用confirmed_segments，这些是用户确认过的片段
+            confirmed_legacy = [seg.to_legacy_dict() for seg in confirmed_segments]
+            
+            # 确保所有片段都有final_text
+            for seg in confirmed_legacy:
+                if not seg.get('final_text'):
+                    seg['final_text'] = (
+                        seg.get('optimized_text') or 
+                        seg.get('translated_text') or 
+                        seg.get('original_text', '')
+                    )
+            
+            subtitle_processor.save_subtitle(confirmed_legacy, subtitle_output, 'srt')
             
             # 保存结果到session
             with open(audio_output, 'rb') as f:
@@ -728,18 +806,41 @@ class WorkflowManager:
             
             # 计算统计信息
             optimized_segments = session_data.get('optimized_segments', [])
-            cost_summary = tts.get_cost_summary()
+            
+            # 汇总所有API使用统计
+            tts_cost_summary = tts.get_cost_summary()
+            
+            # 获取翻译API的token统计
+            translator = session_data.get('translator_instance')
+            if not translator:
+                # 如果没有保存的实例，创建一个新实例来获取统计（虽然可能不完整）
+                from translation.translator import Translator
+                translator = Translator(self.config)
+            
+            translation_stats = translator.get_token_stats()
+            
+            # 合并统计信息
+            combined_api_usage = {
+                'tts_api': tts_cost_summary,
+                'translation_api': translation_stats,
+                'total_api_calls': tts_cost_summary.get('api_calls', 0) + translation_stats.get('total_requests', 0),
+                'session_duration_seconds': max(
+                    tts_cost_summary.get('session_duration_seconds', 0),
+                    translation_stats.get('session_duration_minutes', 0) * 60
+                )
+            }
             
             session_data['completion_results'] = {
                 'audio_data': audio_data,
                 'subtitle_data': subtitle_data,
                 'target_lang': target_lang,
-                'optimized_segments': [seg.to_legacy_dict() for seg in optimized_segments],
-                'cost_summary': cost_summary,
+                'optimized_segments': [seg.to_legacy_dict() for seg in confirmed_segments],  # 使用用户确认后的segments
+                'cost_summary': tts_cost_summary,  # 保持向后兼容
+                'api_usage_summary': combined_api_usage,  # 新的综合统计
                 'stats': {
-                    'total_segments': len(translated_original),
-                    'total_duration': max(seg.end for seg in translated_original) if translated_original else 0,
-                    'excellent_sync': sum(1 for seg in optimized_segments if seg.quality == 'excellent')
+                    'total_segments': len(confirmed_segments),
+                    'total_duration': max(seg.end for seg in confirmed_segments) if confirmed_segments else 0,
+                    'excellent_sync': sum(1 for seg in confirmed_segments if seg.quality == 'excellent')
                 }
             }
             

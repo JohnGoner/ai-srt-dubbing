@@ -270,17 +270,18 @@ class Translator:
         if not segments:
             return []
         
-        # 动态调整批次大小，充分利用并发能力
+        # 动态调整批次大小，充分利用更高的并发能力
+        # 提高并发数：将最大并发数提升一倍，但不超过批次数
         optimal_batch_size = self._calculate_optimal_batch_size(len(segments))
         batches = [segments[i:i + optimal_batch_size] for i in range(0, len(segments), optimal_batch_size)]
         
-        # 计算实际并发数
-        actual_concurrent = min(len(batches), self.max_concurrent_requests)
+        # 提高并发数，最大为原设定的2倍，但不超过批次数
+        increased_concurrent = min(len(batches), self.max_concurrent_requests * 2)
         
         logger.info(f"并发翻译策略：{len(segments)} 个片段 -> {len(batches)} 个批次（每批 {optimal_batch_size} 个）")
-        logger.info(f"并发执行：{actual_concurrent} 个并发任务（最大限制 {self.max_concurrent_requests}）")
+        logger.info(f"并发执行：{increased_concurrent} 个并发任务（最大限制 {self.max_concurrent_requests * 2}）")
         
-        self._report_progress(15, 100, f"创建{len(batches)}个并发翻译任务（{actual_concurrent}个并发执行）...")
+        self._report_progress(15, 100, f"创建{len(batches)}个并发翻译任务（{increased_concurrent}个并发执行）...")
         
         # 使用线程池并发处理
         translated_segments = []
@@ -302,7 +303,9 @@ class Translator:
                     # 缓存结果
                     batch = future_to_batch[future]
                     for original, translated in zip(batch, batch_result):
-                        self._cache_translation(original.get('text'), target_language, translated)
+                        text = original.get('text')
+                        if text:
+                            self._cache_translation(text, target_language, translated)
                     
                     # 更新进度
                     completed_batches += 1
@@ -555,6 +558,8 @@ class Translator:
             
             # 解析翻译结果
             translation_result = response.choices[0].message.content
+            if not translation_result:
+                raise ValueError("翻译API返回空结果")
             translated_segments = self._parse_translation_result(segments, translation_result)
             
             return translated_segments
@@ -577,20 +582,20 @@ class Translator:
         """
         language_name = self.language_names.get(target_language, target_language)
         
-        # 构建简化版prompt，专注于翻译质量
-        prompt = f"""你是一个专业的翻译专家，将以下中文文本翻译为{language_name}：
+        # 构建适合短视频口播的prompt，专注于日常化表达
+        prompt = f"""你是一个短视频配音翻译师，将以下中文文本翻译为{language_name}：
 
 **翻译要求：**
-1. 保持语义准确性和自然表达
-2. 符合{language_name}的语言习惯和表达方式
-3. 适合短视频平台口播，语言生动但不失严谨
-4. 保持原文的逻辑结构和重点信息
+1. 使用日常口语化的表达，就像朋友间聊天一样自然
+2. 避免书面语和学术词汇，多用简单直白的词汇
+3. 语调轻松活泼，适合短视频观众的接受习惯
+4. 保持内容的准确性，但表达方式要接地气
 
 **语言风格：**
-- 叙事性的科普类文本
-- 严肃中带有生动
-- 符合当地人的用语习惯
-- 避免过于复杂的词汇
+- 就像本地人在跟朋友介绍有趣事物
+- 用词简单易懂，避免复杂术语
+- 语气自然亲切，有感染力
+- 符合短视频平台的表达习惯
 
 **返回格式：**
 {{
@@ -606,10 +611,10 @@ class Translator:
         
         prompt += f"""
 **翻译要点：**
-- 准确传达原文含义
-- 使用自然流畅的{language_name}表达
-- 保持科普内容的准确性
-- 确保翻译适合口语化表达
+- 准确传达原文含义，但用最简单的话说出来
+- 就像{language_name}当地人在日常对话中会用的表达
+- 让观众一听就懂，不需要思考
+- 语气要有趣生动，能抓住注意力
 """
         
         return prompt
@@ -745,26 +750,28 @@ class Translator:
         language_name = self.language_names.get(target_language, target_language)
         
         prompt = f"""请将以下中文文本翻译成{language_name}，要求：
-1. 保持语义准确性
-2. 使用自然表达
-3. 考虑时间约束({duration:.2f}秒)，确保翻译后的文本能在此时间内正常朗读
+1. 用最日常、最口语化的表达方式
+2. 就像{language_name}当地人平时聊天时会说的话
+3. 考虑时间约束({duration:.2f}秒)，用简洁有力的表达
+4. 避免复杂词汇，让观众一听就懂
 
 原文: {text}
 
-请直接返回翻译结果，不要包含其他内容。"""
+请直接返回翻译结果，语气要自然亲切，适合短视频配音。"""
         
         # 使用新版本API
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "你是一个专业的翻译专家。"},
+                {"role": "system", "content": "你是一个短视频配音翻译师，擅长将内容转化为日常口语化的表达。"},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=500,
             temperature=self.temperature
         )
         
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        return content.strip() if content else ""
     
     def estimate_speech_time(self, text: str, language: str) -> float:
         """
@@ -951,7 +958,13 @@ class Translator:
         try:
             # 确保 client 已经初始化
             if self.client is None:
-                self._initialize_client()
+                if self.use_kimi:
+                    self.client = OpenAI(
+                        api_key=self.api_key,
+                        base_url=self.base_url
+                    )
+                else:
+                    self.client = OpenAI(api_key=self.api_key)
 
             response = self.client.embeddings.create(
                 input=[text],

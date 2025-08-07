@@ -98,7 +98,7 @@ class SubtitleProcessor:
             vtt = webvtt_read(vtt_path)
             segments = []
             
-            for i, caption in enumerate(vtt):
+            for i, caption in enumerate(vtt.captions):
                 # 转换时间码为秒
                 start_time = self._vtt_time_to_seconds(caption.start)
                 end_time = self._vtt_time_to_seconds(caption.end)
@@ -163,6 +163,28 @@ class SubtitleProcessor:
             logger.error(f"解析VTT时间失败: {str(e)}")
             return 0.0
     
+    def validate_subtitle_text(self, segments: List[Dict[str, Any]]) -> bool:
+        """
+        验证字幕文本的一致性
+        
+        Args:
+            segments: 片段列表
+            
+        Returns:
+            是否所有片段都有有效的最终文本
+        """
+        for segment in segments:
+            final_text = (segment.get('final_text') or 
+                         segment.get('optimized_text') or 
+                         segment.get('translated_text') or 
+                         segment.get('original_text'))
+            
+            if not final_text or final_text.strip() == '':
+                logger.warning(f"片段 {segment.get('id')} 缺少有效文本")
+                return False
+        
+        return True
+
     def save_subtitle(self, segments: List[Dict[str, Any]], output_path: str, format: str = 'srt'):
         """
         保存字幕文件
@@ -170,15 +192,19 @@ class SubtitleProcessor:
         Args:
             segments: 片段列表
             output_path: 输出文件路径
-            format: 输出格式 ('srt' 或 'vtt')
+            format: 输出格式
         """
         try:
+            # 添加验证
+            if not self.validate_subtitle_text(segments):
+                logger.warning("字幕文本验证失败，可能存在空文本片段")
+            
             if format.lower() == 'srt':
                 self._save_srt(segments, output_path)
             elif format.lower() == 'vtt':
                 self._save_vtt(segments, output_path)
             else:
-                raise ValueError(f"不支持的输出格式: {format}")
+                raise ValueError(f"不支持的字幕格式: {format}")
                 
         except Exception as e:
             logger.error(f"保存字幕文件失败: {str(e)}")
@@ -199,8 +225,10 @@ class SubtitleProcessor:
                 start_time = self._seconds_to_srt_time(segment['start'])
                 end_time = self._seconds_to_srt_time(segment['end'])
                 
-                # 优先使用翻译文本，然后是原始文本，最后是text字段
-                text = (segment.get('translated_text') or 
+                # 修改：优先使用final_text，确保使用最终确认的文本
+                text = (segment.get('final_text') or 
+                       segment.get('optimized_text') or 
+                       segment.get('translated_text') or 
                        segment.get('original_text') or 
                        segment.get('text', ''))
                 

@@ -37,13 +37,18 @@ class CacheSelectionView:
             related_caches = cache_integration.get_all_related_caches(content_hash, skip_validation=True)
             
             if related_caches:
-                st.success(f"✅ 发现 {len(related_caches)} 个相关缓存")
+                # 将字典转换为列表
+                cache_list = []
+                for cache_type, cache_entries in related_caches.items():
+                    cache_list.extend(cache_entries)
+                
+                st.success(f"✅ 发现 {len(cache_list)} 个相关缓存")
                 
                 # 显示缓存选项
                 cache_options = ["开始新处理"]
                 cache_descriptions = ["从头开始处理，不使用缓存"]
                 
-                for i, cache in enumerate(related_caches):
+                for i, cache in enumerate(cache_list):
                     cache_type = self._determine_cache_type(cache)
                     cache_options.append(f"使用缓存 {i+1}: {cache_type}")
                     cache_descriptions.append(self._get_cache_description(cache))
@@ -64,7 +69,7 @@ class CacheSelectionView:
                         if selected_index == 0:
                             return {'action': 'new_processing'}
                         else:
-                            cache_data = related_caches[selected_index - 1]
+                            cache_data = cache_list[selected_index - 1]
                             return {
                                 'action': 'use_cache',
                                 'cache_data': cache_data

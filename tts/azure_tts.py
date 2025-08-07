@@ -4,7 +4,7 @@ Azure TTS模块 - 支持循环逼近算法的精确语速控制
 """
 
 import azure.cognitiveservices.speech as speechsdk
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
 import tempfile
 import os
@@ -280,8 +280,8 @@ class AzureTTS:
         return audio_segments
     
     def _generate_single_audio(self, text: str, voice_name: str, 
-                              speech_rate: float = None, 
-                              target_duration: float = None) -> AudioSegment:
+                              speech_rate: Optional[float] = None, 
+                              target_duration: Optional[float] = None) -> AudioSegment:
         """
         生成单个音频片段 - 支持精确语速控制和故障切换
         
@@ -318,6 +318,9 @@ class AzureTTS:
                 
                 # 合成语音
                 result = synthesizer.speak_ssml_async(ssml).get()
+                
+                if result is None:
+                    raise Exception("语音合成返回空结果")
                 
                 if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                     # 成功，重置错误计数
@@ -702,7 +705,7 @@ class AzureTTS:
             'endpoint': self.endpoint
         }
     
-    def test_voice_synthesis(self, text: str = "这是一个测试", voice_name: str = None) -> bool:
+    def test_voice_synthesis(self, text: str = "这是一个测试", voice_name: Optional[str] = None) -> bool:
         """
         测试语音合成功能，支持故障切换
         
@@ -722,7 +725,9 @@ class AzureTTS:
             logger.info(f"当前使用key {key_info['current_key_index'] + 1}: {key_info['current_key']}")
             
             # 使用基础语速进行测试
-            test_audio = self._generate_single_audio(text, voice_name, 1.0)
+            if voice_name is None:
+                voice_name = list(self.voice_map.values())[0]
+            test_audio = self._generate_single_audio(text, voice_name, 1.0)  # type: ignore
             
             logger.info(f"语音合成测试成功 - 时长: {len(test_audio)/1000:.2f}s")
             return True
@@ -731,7 +736,7 @@ class AzureTTS:
             logger.error(f"语音合成测试失败: {str(e)}")
             return False
     
-    def get_available_voices(self, language: str = None) -> List[str]:
+    def get_available_voices(self, language: Optional[str] = None) -> List[str]:
         """
         获取可用的语音列表
         

@@ -121,7 +121,7 @@ class TranslationValidationInterface:
             )
             
             submitted = st.form_submit_button("确认此片段的修改")
-            if submitted:
+            if submitted and edited_text is not None:
                 self._save_adjustment(seg_id, edited_text, speech_rate)
                 st.success(f"片段 #{seg_id} 的修改已保存。")
 
@@ -248,7 +248,7 @@ def create_validation_workflow(validated_segments: List[Dict], config: dict,
     Returns:
         用户确认后的片段列表和调整选择
     """
-    interface = TranslationValidationInterface(validated_segments, progress_callback)
+    interface = TranslationValidationInterface(validated_segments, progress_callback if progress_callback else lambda x: None)
     
     if progress_callback:
         progress_callback(0, 1, "显示验证界面")

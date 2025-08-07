@@ -48,6 +48,9 @@ class SegmentDTO:
     user_modified: bool = False  # 用户是否手动修改过
     processing_metadata: Dict[str, Any] = field(default_factory=dict)  # 处理元数据
     
+    # === 原始片段追踪 ===
+    original_indices: List[int] = field(default_factory=list)  # 包含的原始片段编号（从1开始）
+    
     # 兼容性字段（用于过渡期）
     text: str = ""  # 向后兼容
     duration: float = 0.0  # 向后兼容
@@ -65,13 +68,21 @@ class SegmentDTO:
         if not self.text and self.original_text:
             self.text = self.original_text
         
-        # 自动设置final_text的优先级
+        # 确保original_indices存在且为列表
+        if not hasattr(self, 'original_indices') or not isinstance(self.original_indices, list):
+            self.original_indices = []
+        
+        # 修改：更明确的final_text设置逻辑
         if not self.final_text:
-            self.final_text = (
-                self.optimized_text or 
-                self.translated_text or 
-                self.original_text
-            )
+            # 优先使用optimized_text（经过优化的文本）
+            if self.optimized_text:
+                self.final_text = self.optimized_text
+            # 其次使用translated_text（翻译文本）
+            elif self.translated_text:
+                self.final_text = self.translated_text
+            # 最后使用original_text（原始文本）
+            else:
+                self.final_text = self.original_text
     
     @property 
     def sync_ratio(self) -> float:
@@ -128,6 +139,7 @@ class SegmentDTO:
             'adjustment_suggestions': self.adjustment_suggestions,
             'user_modified': self.user_modified,
             'processing_metadata': self.processing_metadata,
+            'original_indices': self.original_indices,
             # 向后兼容字段
             'text': self.text,
             'duration': self.duration
@@ -168,6 +180,7 @@ class SegmentDTO:
             adjustment_suggestions=legacy_seg.get('adjustment_suggestions', []),
             user_modified=legacy_seg.get('user_modified', legacy_seg.get('text_modified', False)),
             processing_metadata=legacy_seg.get('processing_metadata', {}),
+            original_indices=legacy_seg.get('original_indices', []),
             # 向后兼容
             text=legacy_seg.get('text', ''),
             duration=legacy_seg.get('duration', 0.0)
@@ -199,5 +212,6 @@ class SegmentDTO:
             'adjustment_suggestions': self.adjustment_suggestions,
             'text_modified': self.user_modified,
             'user_modified': self.user_modified,
-            'processing_metadata': self.processing_metadata
+            'processing_metadata': self.processing_metadata,
+            'original_indices': self.original_indices
         } 

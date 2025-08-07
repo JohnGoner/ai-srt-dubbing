@@ -50,7 +50,7 @@ class CacheIntegration:
             是否成功保存
         """
         try:
-            return self.cache_manager.set_cache_entry(file_path, "srt_info", srt_info)
+            return self.cache_manager.save_cache_entry(file_path, "srt_info", srt_info)
         except Exception as e:
             logger.error(f"保存SRT缓存失败: {e}")
             return False
@@ -94,7 +94,7 @@ class CacheIntegration:
                 "confirmed_segments": confirmed_segments,
                 "confirmation_timestamp": time.time()
             }
-            seg_result = self.cache_manager.set_cache_entry(file_path, "segmentation", segmentation_data)
+            seg_result = self.cache_manager.save_cache_entry(file_path, "segmentation", segmentation_data)
             
             # 同时保存confirmation缓存（仅包含确认数据，用于快速恢复）
             confirmation_data = {
@@ -103,7 +103,7 @@ class CacheIntegration:
                 "confirmation_timestamp": time.time(),
                 "cache_type": "segmentation_confirmation"
             }
-            conf_result = self.cache_manager.set_cache_entry(file_path, "confirmation", confirmation_data)
+            conf_result = self.cache_manager.save_cache_entry(file_path, "confirmation", confirmation_data)
             
             return seg_result and conf_result
         except Exception as e:
@@ -162,7 +162,7 @@ class CacheIntegration:
             
             logger.info(f"保存翻译缓存 ({cache_type}): {Path(file_path).name} -> {target_lang}")
             
-            result = self.cache_manager.set_cache_entry(file_path, cache_type, translation_data, target_lang=target_lang)
+            result = self.cache_manager.save_cache_entry(file_path, cache_type, translation_data, target_lang=target_lang)
             return result
             
         except Exception as e:
@@ -203,7 +203,7 @@ class CacheIntegration:
             是否成功保存
         """
         try:
-            return self.cache_manager.set_cache_entry(file_path, "confirmation", confirmation_data, target_lang=target_lang)
+            return self.cache_manager.save_cache_entry(file_path, "confirmation", confirmation_data, target_lang=target_lang)
         except Exception as e:
             logger.error(f"保存确认缓存失败: {e}")
             return False
