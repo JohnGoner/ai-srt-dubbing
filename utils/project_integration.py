@@ -124,6 +124,14 @@ class ProjectIntegration:
                         seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
                         for seg in session_data['optimized_segments']
                     ]
+                # 🔥 关键修复：在音频确认阶段也保存 confirmation_segments 到 final_segments
+                # 这样每次用户确认单个片段后，音频数据和确认状态都会被保存到工程中
+                if 'confirmation_segments' in session_data and session_data['confirmation_segments']:
+                    project.final_segments = [
+                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
+                        for seg in session_data['confirmation_segments']
+                    ]
+                    logger.debug(f"保存了 {len(project.final_segments)} 个确认片段到工程")
             elif processing_stage == 'completion':
                 # 用户确认阶段完成，保存最终结果
                 if 'confirmation_segments' in session_data:

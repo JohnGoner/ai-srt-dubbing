@@ -39,17 +39,24 @@ class MinimaxTTS:
             raise ValueError("未配置MiniMax API密钥")
         
         self.tts_config = config.get('tts', {})
+        minimax_config = self.tts_config.get('minimax', {})
         
-        # 语音映射 - MiniMax支持的语音ID（统一使用英语表达语音）
-        self.voice_map = self.tts_config.get('minimax', {}).get('voices', {
-            'en': 'English_expressive_narrator',  # 英语表达语音
-            'zh': 'English_expressive_narrator',  # 中文也使用英语语音
-            'ja': 'English_expressive_narrator',  # 日语也使用英语语音
-            'ko': 'English_expressive_narrator',  # 韩语也使用英语语音
-            'es': 'English_expressive_narrator',  # 西班牙语也使用英语语音
-            'fr': 'English_expressive_narrator',  # 法语也使用英语语音
-            'de': 'English_expressive_narrator'   # 德语也使用英语语音
+        # 音色映射 - 从配置文件获取，格式与ElevenLabs保持一致
+        # 结构: {language: {voice_id: voice_name}}
+        self.voice_map = minimax_config.get('voices', {
+            'en': {
+                "moss_audio_ef01c4ea-ce7f-11f0-825a-da3ca3ba36b8": "Moss - 英语男声"
+            }
         })
+        
+        # 默认音色ID（每个语言的第一个音色）
+        self.default_voice_ids = {}
+        for lang, voices in self.voice_map.items():
+            if isinstance(voices, dict) and voices:
+                self.default_voice_ids[lang] = list(voices.keys())[0]
+        
+        # 当前选择的音色（可通过UI更新）
+        self.current_voice_id = None
         
         # 基础语音参数
         self.base_speech_rate = self.tts_config.get('speech_rate', 1.0)
@@ -99,6 +106,35 @@ class MinimaxTTS:
 
         # 动态校准相关
         self._calibration_factors: Dict[str, Dict[str, float]] = {}
+        
+        logger.info(f"MiniMax TTS初始化完成，基础语速: {self.base_speech_rate}")
+    
+    def set_voice(self, voice_id: str):
+        """
+        设置当前使用的音色
+        
+        Args:
+            voice_id: 音色ID
+        """
+        self.current_voice_id = voice_id
+        logger.info(f"已设置MiniMax音色: {voice_id}")
+    
+    def get_voice_id(self, language: str) -> str:
+        """
+        获取指定语言的音色ID
+        
+        Args:
+            language: 语言代码
+            
+        Returns:
+            音色ID
+        """
+        # 如果已设置当前音色，优先使用
+        if self.current_voice_id:
+            return self.current_voice_id
+        
+        # 否则使用语言的默认音色
+        return self.default_voice_ids.get(language, "moss_audio_ef01c4ea-ce7f-11f0-825a-da3ca3ba36b8")
     
     def generate_audio_segments(self, segments: List[Dict[str, Any]], target_language: str) -> List[Dict[str, Any]]:
         """
@@ -112,12 +148,12 @@ class MinimaxTTS:
             包含音频数据的片段列表
         """
         try:
-            logger.info(f"开始并发生成 {len(segments)} 个音频片段")
+            logger.info(f"MiniMax开始并发生成 {len(segments)} 个音频片段")
             
             # 获取对应语言的语音
-            voice_id = self.voice_map.get(target_language)
+            voice_id = self.get_voice_id(target_language)
             if not voice_id:
-                raise ValueError(f"不支持的语言: {target_language}")
+                raise ValueError(f"未找到语言 {target_language} 的音色配置")
             
             return self._generate_audio_segments_concurrent(segments, voice_id)
             
@@ -125,13 +161,14 @@ class MinimaxTTS:
             logger.error(f"生成音频片段失败: {str(e)}")
             raise
     
-    def _generate_audio_segments_concurrent(self, segments: List[Dict[str, Any]], voice_id: str) -> List[Dict[str, Any]]:
+    def _generate_audio_segments_concurrent(self, segments: List[Dict[str, Any]], voice_id: str, use_multi_candidate: bool = False) -> List[Dict[str, Any]]:
         """
         并发生成音频片段
         
         Args:
             segments: 片段列表
             voice_id: 语音ID
+            use_multi_candidate: 是否使用多候选策略（首次批量生成默认关闭以节省API调用）
             
         Returns:
             音频片段列表
@@ -145,18 +182,32 @@ class MinimaxTTS:
         results_lock = threading.Lock()
         completed_count = 0
         
-        logger.info(f"启动并发音频生成: {max_workers}个worker处理{len(segments)}个片段")
+        multi_candidate_info = "（多候选模式）" if use_multi_candidate else "（单次生成）"
+        logger.info(f"启动并发音频生成{multi_candidate_info}: {max_workers}个worker处理{len(segments)}个片段")
         
         def generate_single_segment(segment: Dict, index: int) -> Tuple[int, Dict]:
             """生成单个片段的音频"""
             try:
-                # 使用默认语速生成
-                audio_data = self._generate_single_audio(
-                    segment['translated_text'],
-                    voice_id,
-                    self.base_speech_rate,
-                    segment.get('duration', 0)
-                )
+                target_duration = segment.get('duration', 0)
+                text = segment['translated_text']
+                
+                # 如果启用多候选且目标时长>8秒，使用多候选策略
+                if use_multi_candidate and target_duration > 8.0:
+                    audio_data = self._generate_audio_with_best_match(
+                        text,
+                        voice_id,
+                        self.base_speech_rate,
+                        target_duration,
+                        num_candidates=3
+                    )
+                else:
+                    # 使用默认语速生成
+                    audio_data = self._generate_single_audio(
+                        text,
+                        voice_id,
+                        self.base_speech_rate,
+                        target_duration
+                    )
                 
                 # 创建音频片段对象
                 audio_segment = {
@@ -166,7 +217,8 @@ class MinimaxTTS:
                     'original_text': segment.get('original_text', ''),
                     'translated_text': segment['translated_text'],
                     'audio_data': audio_data,
-                    'duration': segment.get('duration', 0)
+                    'duration': segment.get('duration', 0),
+                    'multi_candidate_used': use_multi_candidate and target_duration > 1.0
                 }
                 
                 return index, audio_segment
@@ -630,7 +682,7 @@ class MinimaxTTS:
             'duration': segment.get('duration', 0)
         }
     
-    def test_voice_synthesis(self, text: str = "这是一个测试", voice_id: Optional[str] = None) -> bool:
+    def test_voice_synthesis(self, text: str = "Hello, this is a test.", voice_id: Optional[str] = None) -> bool:
         """
         测试语音合成功能
         
@@ -643,7 +695,7 @@ class MinimaxTTS:
         """
         try:
             if not voice_id:
-                voice_id = list(self.voice_map.values())[0]
+                voice_id = self.default_voice_ids.get('en', "moss_audio_ef01c4ea-ce7f-11f0-825a-da3ca3ba36b8")
             
             logger.info(f"开始测试MiniMax TTS - 语音ID: {voice_id}")
             
@@ -656,7 +708,7 @@ class MinimaxTTS:
             logger.error(f"语音合成测试失败: {str(e)}")
             return False
     
-    def get_available_voices(self, language: Optional[str] = None) -> List[str]:
+    def get_available_voices(self, language: Optional[str] = None) -> Dict[str, str]:
         """
         获取可用的语音列表
         
@@ -664,12 +716,19 @@ class MinimaxTTS:
             language: 语言代码（可选）
             
         Returns:
-            可用语音列表
+            音色字典 {voice_id: voice_name}
         """
-        if language:
-            return [voice for lang, voice in self.voice_map.items() if lang == language]
-        else:
-            return list(self.voice_map.values())
+        if language and language in self.voice_map:
+            voices = self.voice_map[language]
+            if isinstance(voices, dict):
+                return voices
+        
+        # 返回所有语言的音色
+        all_voices = {}
+        for lang_voices in self.voice_map.values():
+            if isinstance(lang_voices, dict):
+                all_voices.update(lang_voices)
+        return all_voices
     
     def get_optimal_rate_for_language(self, language: str, base_rate: float = 1.0) -> float:
         """
@@ -906,25 +965,109 @@ class MinimaxTTS:
         """获取指定语言的当前校准因子"""
         return self._calibration_factors.get(language, {}).get('factor', 1.0)
 
-    def synthesize_speech_optimized(self, text: str, language: str, speech_rate: float, file_prefix: str = "tts_segment") -> str:
+    def synthesize_speech_optimized(self, text: str, language: str, speech_rate: float, file_prefix: str = "tts_segment", target_duration: Optional[float] = None, num_candidates: int = 1) -> str:
         """
         兼容sync_manager的音频合成方法，自动选择voice并保存为wav文件，返回文件路径
+        
         Args:
             text: 合成文本
             language: 目标语言代码
             speech_rate: 语速倍率
             file_prefix: 文件名前缀
+            target_duration: 目标时长（秒），如果提供则从多候选中选择最接近的
+            num_candidates: 候选数量，默认1（不使用多候选策略）
+            
         Returns:
             生成的音频文件路径
         """
-        voice_id = self.voice_map.get(language)
+        voice_id = self.get_voice_id(language)
         if not voice_id:
             raise ValueError(f"未配置语言 {language} 的voice")
-        audio_segment = self._generate_single_audio(text, voice_id, speech_rate)
+        
+        # 如果需要多候选选优
+        if target_duration and num_candidates > 1:
+            audio_segment = self._generate_audio_with_best_match(
+                text, voice_id, speech_rate, target_duration, num_candidates
+            )
+        else:
+            audio_segment = self._generate_single_audio(text, voice_id, speech_rate)
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", prefix=file_prefix + "_") as f:
             audio_segment.export(f.name, format="wav")
             file_path = f.name
         return file_path
+    
+    def _generate_audio_with_best_match(
+        self, 
+        text: str, 
+        voice_id: str, 
+        speech_rate: float, 
+        target_duration: float,
+        num_candidates: int = 3
+    ) -> AudioSegment:
+        """
+        生成多个音频候选，选择时长最接近目标的
+        
+        Args:
+            text: 文本内容
+            voice_id: 语音ID
+            speech_rate: 语速倍率
+            target_duration: 目标时长（秒）
+            num_candidates: 候选数量
+            
+        Returns:
+            最佳匹配的音频片段
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        candidates = []
+        target_ms = target_duration * 1000
+        overflow_threshold_ms = 100  # 超时阈值：超过目标100ms视为"超时"
+        
+        logger.info(f"🎯 多候选TTS: {num_candidates}候选, 目标={target_duration:.2f}s")
+        
+        def generate_candidate(idx: int) -> Tuple[int, Optional[AudioSegment], float, bool]:
+            """生成单个候选，返回(索引, 音频, 误差, 是否超时)"""
+            try:
+                audio = self._generate_single_audio(text, voice_id, speech_rate)
+                duration_ms = len(audio)
+                error = abs(duration_ms - target_ms)
+                is_overflow = duration_ms > target_ms + overflow_threshold_ms  # 超过目标+100ms
+                status = "⚠️超时" if is_overflow else "✓"
+                logger.debug(f"  候选#{idx+1}: {duration_ms/1000:.2f}s, 误差{error:.0f}ms {status}")
+                return idx, audio, error, is_overflow
+            except Exception as e:
+                logger.warning(f"  候选#{idx+1}失败: {e}")
+                return idx, None, float('inf'), True
+        
+        # 并发生成候选（控制并发数，避免API限制）
+        max_workers = min(num_candidates, 2)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(generate_candidate, i) for i in range(num_candidates)]
+            
+            for future in as_completed(futures):
+                idx, audio, error, is_overflow = future.result()
+                if audio is not None:
+                    candidates.append((audio, error, idx, is_overflow))
+        
+        if not candidates:
+            logger.error("多候选全部失败，使用静音")
+            return AudioSegment.silent(duration=int(target_ms))
+        
+        # 选优策略：优先选择"不超时"的候选，在不超时的候选中选误差最小的
+        non_overflow = [(a, e, i, o) for a, e, i, o in candidates if not o]
+        
+        if non_overflow:
+            # 有不超时的候选，从中选误差最小的
+            best_audio, best_error, best_idx, _ = min(non_overflow, key=lambda x: x[1])
+            logger.info(f"✅ 选中#{best_idx+1}(安全), 误差={best_error:.0f}ms, 时长={len(best_audio)/1000:.2f}s")
+        else:
+            # 全部超时，选择超时最少的（误差最小的）
+            best_audio, best_error, best_idx, _ = min(candidates, key=lambda x: x[1])
+            logger.warning(f"⚠️ 全部超时，选中#{best_idx+1}, 误差={best_error:.0f}ms, 时长={len(best_audio)/1000:.2f}s")
+        
+        return best_audio
 
     def get_audio_duration(self, audio_file_path: str) -> float:
         """

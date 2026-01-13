@@ -281,14 +281,15 @@ class AudioSynthesizer:
             # 降级方案：返回原音频
             return audio_segment
     
-    def regenerate_audio_with_modified_text(self, confirmation_data: Dict, tts, target_language: str) -> Dict:
+    def regenerate_audio_with_modified_text(self, confirmation_data: Dict, tts, target_language: str, use_multi_candidate: bool = True) -> Dict:
         """
-        使用用户修改的文本重新生成音频
+        使用用户修改的文本重新生成音频（支持多候选策略）
         
         Args:
             confirmation_data: 确认数据
             tts: TTS实例
             target_language: 目标语言
+            use_multi_candidate: 是否使用多候选策略（默认True）
             
         Returns:
             更新后的确认数据
@@ -307,9 +308,12 @@ class AudioSynthesizer:
                 modified_text, target_language, target_duration
             )
             
-            # 生成新的原始音频
-            raw_new_audio = self._generate_single_audio(
-                modified_text, optimal_rate, tts, target_language
+            # 决定候选数量
+            num_candidates = 3 if use_multi_candidate and target_duration > 1.0 else 1
+            
+            # 生成新的原始音频（使用多候选策略）
+            raw_new_audio = self._generate_single_audio_with_candidates(
+                modified_text, optimal_rate, tts, target_language, target_duration, num_candidates
             )
             
             # 应用音频处理（截断、淡出等）
@@ -326,10 +330,11 @@ class AudioSynthesizer:
                 'timing_error_ms': abs(len(processed_new_audio) / 1000.0 - target_duration) * 1000,
                 'is_truncated': len(raw_new_audio) > target_duration * 1000 + 100,
                 'text_modified': False,  # 重置修改标志
-                'user_modified_text': None
+                'user_modified_text': None,
+                'candidates_used': num_candidates  # 记录使用的候选数
             })
             
-            logger.info(f"重新生成片段 {confirmation_data.get('segment_id', 'unknown')} 音频成功：" +
+            logger.info(f"重新生成片段 {confirmation_data.get('segment_id', 'unknown')} 音频成功 (候选数={num_candidates})：" +
                        f"原始时长 {len(raw_new_audio)/1000:.2f}s -> 处理后时长 {len(processed_new_audio)/1000:.2f}s")
             
         except Exception as e:
@@ -338,9 +343,49 @@ class AudioSynthesizer:
         
         return confirmation_data
     
+    def _generate_single_audio_with_candidates(
+        self, 
+        text: str, 
+        speech_rate: float, 
+        tts, 
+        target_language: str,
+        target_duration: float,
+        num_candidates: int = 3
+    ) -> AudioSegment:
+        """
+        生成音频（支持多候选选优）
+        
+        Args:
+            text: 文本内容
+            speech_rate: 语速
+            tts: TTS实例
+            target_language: 目标语言
+            target_duration: 目标时长
+            num_candidates: 候选数量
+            
+        Returns:
+            最佳匹配的音频数据
+        """
+        try:
+            if num_candidates > 1 and hasattr(tts, '_generate_audio_with_best_match'):
+                # 使用多候选策略
+                voice_id = tts.get_voice_id(target_language)
+                audio_data = tts._generate_audio_with_best_match(
+                    text, voice_id, speech_rate, target_duration, num_candidates
+                )
+                return audio_data
+            else:
+                # 单次生成
+                return self._generate_single_audio(text, speech_rate, tts, target_language)
+                
+        except Exception as e:
+            logger.error(f"多候选音频生成失败: {e}")
+            # 回退到单次生成
+            return self._generate_single_audio(text, speech_rate, tts, target_language)
+    
     def merge_confirmed_audio_segments(self, confirmed_segments: List[Dict]) -> AudioSegment:
         """
-        合并用户确认后的音频片段
+        合并用户确认后的音频片段（带安全间隙检查）
         
         Args:
             confirmed_segments: 用户确认后的片段列表
@@ -355,95 +400,149 @@ class AudioSynthesizer:
                 logger.warning("没有音频片段可合并")
                 return AudioSegment.silent(duration=1000)
             
-            # 添加详细的调试日志
-            logger.info(f"开始过滤确认片段，总数: {len(confirmed_segments)}")
-            for i, seg in enumerate(confirmed_segments):
-                confirmed = seg.get('confirmed', False)
-                has_audio = seg.get('audio_data') is not None
-                seg_id = seg.get('id', seg.get('segment_id', f'seg_{i}'))
-                quality = seg.get('quality', 'unknown')
-                timing_error = seg.get('timing_error_ms', 0)
-                user_modified = seg.get('user_modified', seg.get('text_modified', False))
-                
-                logger.debug(f"片段 {seg_id}: confirmed={confirmed}, has_audio={has_audio}, "
-                           f"quality={quality}, timing_error={timing_error}ms, user_modified={user_modified}")
-            
             # 过滤出已确认且有音频数据的片段
             valid_segments = [
                 seg for seg in confirmed_segments 
                 if seg.get('confirmed', False) and seg.get('audio_data') is not None
             ]
             
-            logger.info(f"过滤后有效片段数: {len(valid_segments)}")
+            logger.info(f"有效片段数: {len(valid_segments)}/{len(confirmed_segments)}")
             
             if not valid_segments:
                 logger.warning("没有有效的音频片段")
                 return AudioSegment.silent(duration=1000)
             
-            # 按时间码排序 - 更灵活的时间获取方式
+            # 按时间码排序
             def get_start_time(seg):
-                # 尝试多种方式获取开始时间
                 if 'segment_data' in seg and seg['segment_data']:
                     return seg['segment_data'].get('start', 0)
-                # 直接从片段获取
                 return seg.get('start', seg.get('start_time', 0))
             
             def get_end_time(seg):
-                # 尝试多种方式获取结束时间
                 if 'segment_data' in seg and seg['segment_data']:
                     return seg['segment_data'].get('end', 0)
-                # 直接从片段获取
                 return seg.get('end', seg.get('end_time', 0))
             
             sorted_segments = sorted(valid_segments, key=get_start_time)
             
+            # 安全间隙检查与自动截断
+            sorted_segments = self._apply_safety_truncation(sorted_segments, get_start_time, get_end_time)
+            
             # 计算总时长
-            total_duration = 0
-            if sorted_segments:
-                total_duration = max(get_end_time(seg) for seg in sorted_segments)
+            total_duration = max(get_end_time(seg) for seg in sorted_segments) if sorted_segments else 0
             
             if total_duration <= 0:
-                logger.warning("无法确定总时长，使用片段音频时长估算")
                 total_duration = sum(len(seg.get('audio_data', AudioSegment.empty())) / 1000.0 for seg in sorted_segments)
             
             # 创建空白音频
             final_audio = AudioSegment.silent(duration=int(total_duration * 1000))
             
-            logger.info(f"开始合并 {len(sorted_segments)} 个确认片段，总时长: {total_duration:.2f}s")
+            logger.info(f"合并 {len(sorted_segments)} 个片段，总时长: {total_duration:.2f}s")
             
             # 逐个插入音频片段
             for segment in sorted_segments:
                 try:
                     audio_data = segment.get('audio_data')
                     if audio_data is None:
-                        logger.warning(f"片段 {segment.get('segment_id', 'unknown')} 缺少音频数据")
                         continue
                     
                     start_time = get_start_time(segment)
                     start_ms = int(start_time * 1000)
                     
-                    # 确保插入位置不超出总音频范围
                     if start_ms >= len(final_audio):
-                        logger.warning(f"片段 {segment.get('segment_id', 'unknown')} 开始时间 {start_time}s 超出总时长")
                         continue
                     
-                    # 插入音频片段
                     final_audio = final_audio.overlay(audio_data, position=start_ms)
                     
-                    logger.debug(f"插入片段 {segment.get('segment_id', 'unknown')} 在 {start_time:.2f}s 位置，"
-                               f"音频长度: {len(audio_data)/1000:.2f}s，"
-                               f"是否截断: {segment.get('is_truncated', False)}")
-                    
                 except Exception as e:
-                    logger.error(f"插入片段 {segment.get('segment_id', 'unknown')} 失败: {e}")
+                    logger.error(f"插入片段失败: {e}")
                     continue
             
-            logger.info(f"音频片段合并完成，最终时长: {len(final_audio)/1000:.2f}s")
+            logger.info(f"合并完成，最终时长: {len(final_audio)/1000:.2f}s")
             return final_audio
             
         except Exception as e:
             logger.error(f"合并音频片段失败: {e}")
             raise
+    
+    def _apply_safety_truncation(self, sorted_segments: List[Dict], get_start_time, get_end_time) -> List[Dict]:
+        """
+        应用安全截断：确保每个片段不会侵入下一个片段的时间窗口
+        
+        Args:
+            sorted_segments: 按时间排序的片段列表
+            get_start_time: 获取开始时间的函数
+            get_end_time: 获取结束时间的函数
+            
+        Returns:
+            处理后的片段列表
+        """
+        if len(sorted_segments) <= 1:
+            return sorted_segments
+        
+        processed_segments = []
+        overlap_warnings = []
+        
+        for i, segment in enumerate(sorted_segments):
+            audio_data = segment.get('audio_data')
+            if audio_data is None:
+                processed_segments.append(segment)
+                continue
+            
+            seg_id = segment.get('segment_id', segment.get('id', f'seg_{i}'))
+            start_time = get_start_time(segment)
+            end_time = get_end_time(segment)  # 字幕结束时间（允许的最大时间窗口）
+            audio_duration_ms = len(audio_data)
+            audio_end_time = start_time + audio_duration_ms / 1000.0
+            
+            # 计算允许的最大时长（到下一个片段开始前，保留安全间隙）
+            if i < len(sorted_segments) - 1:
+                next_start = get_start_time(sorted_segments[i + 1])
+                max_allowed_end = next_start - self.min_overlap_buffer  # 保留50ms安全间隙
+            else:
+                max_allowed_end = float('inf')  # 最后一个片段无限制
+            
+            # 检查是否需要截断
+            need_truncate = False
+            truncate_reason = ""
+            
+            # 情况1：音频超出字幕结束时间
+            if audio_end_time > end_time + 0.1:  # 允许100ms容差
+                need_truncate = True
+                truncate_reason = f"超出字幕窗口({audio_end_time:.2f}s > {end_time:.2f}s)"
+            
+            # 情况2：音频会侵入下一个片段
+            if audio_end_time > max_allowed_end:
+                need_truncate = True
+                truncate_reason = f"侵入下一片段({audio_end_time:.2f}s > {max_allowed_end:.2f}s)"
+                overlap_warnings.append(seg_id)
+            
+            if need_truncate:
+                # 计算安全的最大时长
+                safe_end = min(end_time, max_allowed_end)
+                safe_duration_ms = int((safe_end - start_time) * 1000)
+                
+                if safe_duration_ms > 0 and safe_duration_ms < audio_duration_ms:
+                    # 截断并添加淡出
+                    fade_duration = min(100, safe_duration_ms // 10)
+                    truncated_audio = audio_data[:safe_duration_ms]
+                    if fade_duration > 0:
+                        truncated_audio = truncated_audio.fade_out(fade_duration)
+                    
+                    logger.warning(f"⚠️ 片段{seg_id}安全截断: {audio_duration_ms}ms → {safe_duration_ms}ms ({truncate_reason})")
+                    
+                    # 更新segment的音频数据
+                    segment = segment.copy()
+                    segment['audio_data'] = truncated_audio
+                    segment['safety_truncated'] = True
+                    segment['original_duration_ms'] = audio_duration_ms
+            
+            processed_segments.append(segment)
+        
+        if overlap_warnings:
+            logger.warning(f"⚠️ {len(overlap_warnings)}个片段因重叠风险被截断: {overlap_warnings[:5]}{'...' if len(overlap_warnings) > 5 else ''}")
+        
+        return processed_segments
     
     def create_confirmation_report(self, confirmation_segments: List[Dict]) -> str:
         """

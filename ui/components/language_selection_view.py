@@ -54,8 +54,12 @@ class LanguageSelectionView:
             voice_display = selected_voice_id
             if 'config' in st.session_state:
                 tts_config = st.session_state['config'].get('tts', {})
+                # 支持 ElevenLabs 和 MiniMax 两种服务的音色名称显示
                 if selected_tts_service == 'elevenlabs':
                     voices = tts_config.get('elevenlabs', {}).get('voices', {}).get(target_lang, {})
+                    voice_display = voices.get(selected_voice_id, selected_voice_id)
+                elif selected_tts_service == 'minimax':
+                    voices = tts_config.get('minimax', {}).get('voices', {}).get(target_lang, {})
                     voice_display = voices.get(selected_voice_id, selected_voice_id)
             st.success(f"**选中音色**: {voice_display}")
         else:

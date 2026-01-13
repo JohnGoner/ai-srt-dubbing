@@ -522,7 +522,7 @@ class PreciseSyncManager:
         logger.info("第一轮音频生成完成")
         return audio_segments
     
-    def _generate_single_audio(self, segment: Dict, tts, target_language: str) -> Dict:
+    def _generate_single_audio(self, segment: Dict, tts, target_language: str, use_multi_candidate: bool = True) -> Dict:
         """
         为单个片段生成音频
         
@@ -530,6 +530,7 @@ class PreciseSyncManager:
             segment: 片段
             tts: TTS实例
             target_language: 目标语言
+            use_multi_candidate: 是否使用多候选策略（默认True）
             
         Returns:
             包含音频文件和音频数据的片段
@@ -537,9 +538,21 @@ class PreciseSyncManager:
         text = segment.get('optimized_text', '')
         speech_rate = segment.get('speech_rate', 1.0)
         segment_id = segment.get('id', 'unknown')
+        target_duration = segment.get('target_duration', 0.0)
         
-        # 生成音频文件
-        audio_file = tts.synthesize_speech_optimized(text, target_language, speech_rate, f"segment_{segment_id}")
+        # 决定是否使用多候选策略
+        # 对于时长要求较严格的片段（目标时长>1秒），使用3候选
+        num_candidates = 3 if use_multi_candidate and target_duration > 1.0 else 1
+        
+        # 生成音频文件（可能使用多候选选优）
+        audio_file = tts.synthesize_speech_optimized(
+            text, 
+            target_language, 
+            speech_rate, 
+            f"segment_{segment_id}",
+            target_duration=target_duration if num_candidates > 1 else None,
+            num_candidates=num_candidates
+        )
         
         # 加载音频数据
         audio_data = None
@@ -554,7 +567,6 @@ class PreciseSyncManager:
         actual_duration = tts.get_audio_duration(audio_file)
         
         # 计算时长误差
-        target_duration = segment.get('target_duration', 0.0)
         timing_error_ms = abs(actual_duration - target_duration) * 1000
         
         # 评估质量
@@ -566,10 +578,11 @@ class PreciseSyncManager:
             'audio_file': audio_file,
             'audio_data': audio_data,  # 添加音频数据
             'timing_error_ms': timing_error_ms,
-            'quality': quality
+            'quality': quality,
+            'candidates_used': num_candidates  # 记录使用的候选数
         })
         
-        logger.debug(f"片段 {segment_id} 音频生成完成: "
+        logger.debug(f"片段 {segment_id} 音频生成完成 (候选数={num_candidates}): "
                     f"实际时长={actual_duration:.2f}s, 目标时长={target_duration:.2f}s, 误差={timing_error_ms:.0f}ms, 质量={quality}")
         
         return result

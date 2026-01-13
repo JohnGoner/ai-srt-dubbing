@@ -568,13 +568,25 @@ def main():
             tts_config = st.session_state['config'].get('tts', {})
             
             if tts_service == 'minimax':
-                # MiniMax音色配置（简单的单一音色映射）
+                # MiniMax音色配置（多音色选择，与ElevenLabs保持一致）
                 minimax_voices = tts_config.get('minimax', {}).get('voices', {})
-                current_voice = minimax_voices.get(target_language, '')
-                if current_voice:
-                    voice_options = {current_voice: current_voice}
-                    st.info(f"📌 MiniMax音色: {current_voice}")
-                    selected_voice_id = current_voice
+                lang_voices = minimax_voices.get(target_language, {})
+                
+                if isinstance(lang_voices, dict) and lang_voices:
+                    voice_options = lang_voices
+                    
+                    # 音色下拉选择
+                    selected_voice_id = st.selectbox(
+                        "选择音色",
+                        options=list(voice_options.keys()),
+                        format_func=lambda x: voice_options.get(x, x),
+                        help="选择MiniMax语音音色",
+                        key="sidebar_minimax_voice"
+                    )
+                    
+                    # 显示选中音色的信息
+                    if selected_voice_id:
+                        st.success(f"✅ 已选择: {voice_options.get(selected_voice_id, selected_voice_id)}")
                 else:
                     st.warning(f"⚠️ 未配置{target_language}语言的MiniMax音色")
                     

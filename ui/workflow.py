@@ -100,10 +100,10 @@ class WorkflowManager:
                 st.session_state['tts_instance'] = tts_engine
                 st.session_state['current_tts_service'] = selected_tts_service
             
-            # 如果是ElevenLabs且用户选择了特定音色，设置它
-            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+            # 如果用户选择了特定音色，设置它
+            if selected_voice_id:
                 tts_engine.set_voice(selected_voice_id)
-                logger.info(f"ElevenLabs设置音色: {selected_voice_id}")
+                logger.info(f"{selected_tts_service}设置音色: {selected_voice_id}")
             
             logger.info(f"开始并发生成 {len(segments)} 个音频片段")
             
