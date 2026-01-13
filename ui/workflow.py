@@ -13,12 +13,12 @@ from loguru import logger
 sys.path.append(str(Path(__file__).parent.parent))
 
 from models.segment_dto import SegmentDTO
+from models.project_dto import ProjectDTO
 from ui.components.segmentation_view import SegmentationView
 from ui.components.language_selection_view import LanguageSelectionView
-# from ui.components.translation_validation_view import TranslationValidationView  # 已移除
 from ui.components.audio_confirmation_view import AudioConfirmationView
 from ui.components.completion_view import CompletionView
-# from ui.components.cache_selection_view import CacheSelectionView  # 注释掉cache相关
+from utils.project_integration import get_project_integration
 
 
 class WorkflowManager:
@@ -26,16 +26,15 @@ class WorkflowManager:
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.project_integration = get_project_integration()
         self._init_components()
     
     def _init_components(self):
         """初始化所有UI组件"""
         self.segmentation_view = SegmentationView()
         self.language_selection_view = LanguageSelectionView()
-        # self.translation_validation_view = TranslationValidationView()  # 已移除
         self.audio_confirmation_view = AudioConfirmationView()
         self.completion_view = CompletionView()
-        # self.cache_selection_view = CacheSelectionView()  # 注释掉cache相关
     
     def render_stage(self, stage: str, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -50,16 +49,12 @@ class WorkflowManager:
         """
         logger.debug(f"🎬 WorkflowManager.render_stage 被调用，阶段: {stage}")
         
-        # 阶段到渲染函数的映射
+        # 阶段到渲染函数的映射（精简后的核心阶段）
         stage_renderers = {
-            # 'cache_selection': self._render_cache_selection,  # 注释掉cache相关
-            # 'cache_restore': self._render_cache_restore,  # 注释掉cache相关
-            'initial': self._render_segmentation_analysis,
-            'segmentation': self._render_segmentation_analysis,  # 添加segmentation阶段
+            'segmentation': self._render_segmentation_analysis,
             'confirm_segmentation': self._render_segmentation_confirmation,
             'language_selection': self._render_language_selection,
             'translating': self._render_translation_progress,
-            'optimizing': self._render_optimization_progress,
             'user_confirmation': self._render_audio_confirmation,
             'completion': self._render_completion
         }
@@ -76,69 +71,109 @@ class WorkflowManager:
             result = renderer(session_data)
             logger.debug(f"✅ 渲染器执行完成，返回状态: {result.get('processing_stage', 'unknown')}")
             logger.debug(f"📋 返回数据概览: segments={len(result.get('segments', []))}, segmented_segments={len(result.get('segmented_segments', []))}")
+            
+            # 自动保存工程进度
+            self._auto_save_project_progress(result)
+            
             return result
         except Exception as e:
             logger.error(f"❌ 渲染阶段 {stage} 时发生错误: {e}", exc_info=True)
             st.error(f"❌ 渲染阶段 {stage} 时发生错误: {str(e)}")
             return session_data
     
-    # def _render_cache_selection(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
-    #     """渲染缓存选择界面"""
-    #     input_file_path = session_data.get('input_file_path')
-    #     if not input_file_path:
-    #         st.error("❌ 未找到文件路径")
-    #         session_data['processing_stage'] = 'initial'
-    #         return session_data
-    #     
-    #     # 使用缓存选择组件
-    #     result = self.cache_selection_view.render(input_file_path)
-    #     
-    #     if result['action'] == 'new_processing':
-    #         session_data['processing_stage'] = 'initial'
-    #     elif result['action'] == 'back':
-    #         session_data['processing_stage'] = 'initial'
-    #         session_data.pop('input_file_path', None)
-    #     elif result['action'] == 'use_cache':
-    #         session_data['selected_cache'] = result['cache_data']
-    #         session_data['processing_stage'] = 'cache_restore'
-    #     
-    #     return session_data
+    def _generate_audio_for_segments(self, segments: List[SegmentDTO], target_language: str) -> List[SegmentDTO]:
+        """为翻译段生成音频（使用TTS并发功能）"""
+        try:
+            from tts import create_tts_engine
+            
+            # 获取用户选择的TTS服务
+            selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+            selected_voice_id = st.session_state.get('selected_voice_id')
+            
+            # 检查TTS实例是否需要重新创建（服务类型变更）
+            tts_engine = st.session_state.get('tts_instance')
+            current_service = st.session_state.get('current_tts_service')
+            
+            if not tts_engine or current_service != selected_tts_service:
+                logger.info(f"创建TTS引擎: {selected_tts_service}")
+                tts_engine = create_tts_engine(self.config, selected_tts_service)
+                st.session_state['tts_instance'] = tts_engine
+                st.session_state['current_tts_service'] = selected_tts_service
+            
+            # 如果是ElevenLabs且用户选择了特定音色，设置它
+            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                tts_engine.set_voice(selected_voice_id)
+                logger.info(f"ElevenLabs设置音色: {selected_voice_id}")
+            
+            logger.info(f"开始并发生成 {len(segments)} 个音频片段")
+            
+            # 准备TTS需要的数据格式
+            segments_for_tts = []
+            valid_segments = []
+            
+            for seg in segments:
+                if seg.final_text:
+                    # 转换为TTS需要的格式
+                    tts_segment = {
+                        'id': seg.id,
+                        'start': seg.start,
+                        'end': seg.end,
+                        'original_text': seg.original_text,
+                        'translated_text': seg.final_text,  # TTS使用final_text
+                        'duration': seg.target_duration
+                    }
+                    segments_for_tts.append(tts_segment)
+                    valid_segments.append(seg)
+            
+            if not segments_for_tts:
+                logger.warning("没有有效的文本片段需要生成音频")
+                return segments
+            
+            # 显示进度提示
+            with st.spinner(f"正在并发生成 {len(segments_for_tts)} 个音频片段..."):
+                # 使用TTS的并发方法
+                audio_segments = tts_engine.generate_audio_segments(segments_for_tts, target_language)
+            
+            # 将音频数据更新回SegmentDTO
+            audio_map = {seg['id']: seg for seg in audio_segments}
+            
+            for seg in valid_segments:
+                if seg.id in audio_map:
+                    audio_seg = audio_map[seg.id]
+                    
+                    # 设置音频数据
+                    if audio_seg.get('audio_data'):
+                        seg.set_audio_data(audio_seg['audio_data'])
+                        
+                        # 计算时长误差和质量评级
+                        if seg.target_duration > 0:
+                            error_ms = abs(seg.actual_duration - seg.target_duration) * 1000
+                            seg.timing_error_ms = error_ms
+                            
+                            # 设置质量评级
+                            error_percent = error_ms / (seg.target_duration * 1000) * 100
+                            if error_percent <= 5:
+                                seg.quality = 'excellent'
+                            elif error_percent <= 15:
+                                seg.quality = 'good'
+                            elif error_percent <= 30:
+                                seg.quality = 'fair'
+                            else:
+                                seg.quality = 'poor'
+                        else:
+                            seg.quality = 'good'  # 默认质量
+                    else:
+                        logger.warning(f"片段 {seg.id} 音频生成失败")
+                        seg.quality = 'error'
+            
+            logger.info(f"✅ 并发生成 {len(segments)} 个片段音频完成")
+            return segments
+            
+        except Exception as e:
+            logger.error(f"❌ 并发生成音频失败: {e}")
+            st.error(f"❌ 并发生成音频失败: {str(e)}")
+            return segments
     
-    # def _render_cache_restore(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
-    #     """渲染缓存恢复界面"""
-    #     selected_cache = session_data.get('selected_cache', {})
-    #     
-    #     if not selected_cache:
-    #         st.error("❌ 缓存数据丢失")
-    #         session_data['processing_stage'] = 'initial'
-    #         return session_data
-    #     
-    #     # 显示恢复进度
-    #     st.header("🔄 正在恢复缓存数据...")
-    #     progress_bar = st.progress(0)
-    #     status_text = st.empty()
-    #     
-    #     try:
-    #         # 恢复数据并转换为SegmentDTO格式
-    #         restored_data = self._restore_cache_data(selected_cache, progress_bar, status_text)
-    #         session_data.update(restored_data)
-    #             
-    #         # 决定下一个阶段
-    #         next_stage = self._determine_next_stage_from_cache(restored_data)
-    #         session_data['processing_stage'] = 'next_stage'
-    #             
-    #         # 清理临时状态
-    #         session_data.pop('selected_cache', None)
-    #             
-    #         st.success("🎉 缓存数据恢复完成！")
-    #         st.rerun()
-    #             
-    #     except Exception as e:
-    #         st.error(f"❌ 缓存数据恢复失败: {str(e)}")
-    #         logger.error(f"缓存数据恢复失败: {e}")
-    #         session_data['processing_stage'] = 'initial'
-    #     
-    #     return session_data
     
     def _render_segmentation_analysis(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """渲染分段分析界面"""
@@ -149,8 +184,31 @@ class WorkflowManager:
         
         if not input_file_path:
             logger.error("❌ 未找到文件路径")
-            st.error("❌ 未找到文件路径")
-            return session_data
+            
+            # 检查是否是从工程加载的情况，如果是，说明用户应该直接跳到后续阶段
+            current_project = session_data.get('current_project')
+            if current_project and isinstance(current_project, ProjectDTO):
+                logger.info("当前是工程模式，检查是否已有分段数据")
+                if current_project.segmented_segments:
+                    logger.info("工程已有分段数据，跳转到分段确认阶段")
+                    session_data['processing_stage'] = 'confirm_segmentation'
+                    return session_data
+                elif current_project.confirmed_segments:
+                    logger.info("工程已有确认分段数据，跳转到语言选择阶段")
+                    session_data['processing_stage'] = 'language_selection'
+                    return session_data
+                elif current_project.translated_segments:
+                    logger.info("工程已有翻译数据，跳转到音频确认阶段")
+                    session_data['processing_stage'] = 'user_confirmation'
+                    return session_data
+                else:
+                    st.error("❌ 工程没有可用的处理数据，请重新上传文件")
+                    session_data['processing_stage'] = 'project_home'
+                    return session_data
+            else:
+                st.error("❌ 未找到文件路径，请重新上传文件")
+                session_data['processing_stage'] = 'project_home'
+                return session_data
         
         # 检查是否已经处理过
         has_segments = 'segments' in session_data and session_data['segments']
@@ -242,9 +300,54 @@ class WorkflowManager:
         
         if not segments or not segmented_segments:
             logger.error("❌ 分段数据丢失")
-            st.error("❌ 分段数据丢失，请重新分析")
-            session_data['processing_stage'] = 'initial'
-            return session_data
+            
+            # 检查是否有当前工程，尝试从工程恢复数据
+            current_project = session_data.get('current_project')
+            if current_project and isinstance(current_project, ProjectDTO):
+                logger.info("尝试从当前工程恢复分段数据")
+                
+                # 改进的恢复逻辑：优先恢复已确认的分段，然后是分段结果，最后是原始片段
+                recovered = False
+                
+                # 1. 尝试从确认分段恢复（优先级最高）
+                if current_project.confirmed_segments:
+                    session_data['segmented_segments'] = [
+                        SegmentDTO.from_legacy_segment(seg) for seg in current_project.confirmed_segments
+                    ]
+                    logger.info(f"✅ 从确认分段恢复segmented_segments: {len(session_data['segmented_segments'])} 个")
+                    recovered = True
+                
+                # 2. 如果没有确认分段，从分段结果恢复
+                elif current_project.segmented_segments:
+                    session_data['segmented_segments'] = [
+                        SegmentDTO.from_legacy_segment(seg) for seg in current_project.segmented_segments
+                    ]
+                    logger.info(f"✅ 从分段结果恢复segmented_segments: {len(session_data['segmented_segments'])} 个")
+                    recovered = True
+                
+                # 3. 恢复原始片段
+                if current_project.segments:
+                    session_data['segments'] = [
+                        SegmentDTO.from_legacy_segment(seg) for seg in current_project.segments
+                    ]
+                    logger.info(f"✅ 从工程恢复segments: {len(session_data['segments'])} 个")
+                    recovered = True
+                
+                if recovered:
+                    # 数据恢复成功，更新本地变量继续处理
+                    segments = session_data.get('segments', [])
+                    segmented_segments = session_data.get('segmented_segments', [])
+                    logger.info(f"✅ 分段数据恢复完成: segments={len(segments)}, segmented_segments={len(segmented_segments)}")
+                else:
+                    st.error("❌ 分段数据丢失且工程中也没有备份数据，需要重新处理")
+                    logger.warning("工程中没有任何分段数据，跳转回工程主页")
+                    session_data['processing_stage'] = 'project_home'
+                    return session_data
+            else:
+                st.error("❌ 分段数据丢失且无当前工程，请重新分析")
+                logger.warning("无法恢复分段数据：没有当前工程或工程数据不完整")
+                session_data['processing_stage'] = 'project_home'
+                return session_data
         
         # 使用分段确认组件
         result = self.segmentation_view.render_confirmation(
@@ -265,8 +368,6 @@ class WorkflowManager:
             
             session_data['confirmed_segments'] = confirmed_segments
             
-            # 保存分段缓存
-            # self._save_segmentation_cache(session_data, confirmed_segments)  # 注释掉cache相关
             
             # 清理分段视图的session_state，因为已经确认完成
             segmentation_keys = ['segmentation_edited_segments', 'segmentation_current_page', 'segmentation_original_segments']
@@ -278,10 +379,13 @@ class WorkflowManager:
             session_data['processing_stage'] = 'language_selection'
             
         elif result['action'] == 'restart':
-            # 重置状态
-            keys_to_reset = ['processing_stage', 'segments', 'segmented_segments']
+            # 重置状态 - 但保持合理的处理阶段
+            keys_to_reset = ['segments', 'segmented_segments', 'input_file_path']
             for key in keys_to_reset:
                 session_data.pop(key, None)
+            
+            # 设置为工程管理主页，而不是删除processing_stage
+            session_data['processing_stage'] = 'project_home'
             
             # 清理分段视图的session_state
             segmentation_keys = ['segmentation_edited_segments', 'segmentation_current_page', 'segmentation_original_segments']
@@ -318,64 +422,131 @@ class WorkflowManager:
     
     def _render_translation_progress(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """渲染翻译进度界面"""
-        with st.spinner("🌐 正在翻译文本..."):
+        logger.debug("🔄 进入翻译进度渲染方法")
+        
+        confirmed_segments = session_data.get('confirmed_segments', [])
+        target_language = session_data.get('target_lang')
+        
+        if not confirmed_segments or not target_language:
+            st.error("❌ 缺少必要的数据进行翻译")
+            session_data['processing_stage'] = 'language_selection'
+            return session_data
+        
+        # 导入翻译工厂
+        from translation.translation_factory import TranslationFactory
+        
+        # 创建进度显示
+        progress_container = st.container()
+        with progress_container:
+            st.subheader("🌍 正在翻译字幕...")
+            
+            # 显示翻译服务信息
+            translation_config = self.config.get('translation', {})
+            if 'service' in translation_config:
+                service_name = translation_config.get('service', 'google').upper()
+                st.info(f"📡 使用 {service_name} 翻译服务进行上下文感知翻译")
+            else:
+                st.info("📡 使用传统GPT翻译服务")
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def progress_callback(current, total, message):
+                progress = int((current / total) * 100) if total > 0 else 0
+                progress_bar.progress(progress)
+                status_text.text(f"{message} ({current}/{total})")
+            
             try:
-                confirmed_segments = session_data.get('confirmed_segments', [])
-                target_lang = session_data.get('target_lang')
+                # 使用翻译工厂创建翻译器
+                translator = TranslationFactory.create_translator(self.config, progress_callback)
                 
-                if not confirmed_segments:
-                    st.error("❌ 未找到确认的分段数据")
-                    session_data['processing_stage'] = 'language_selection'
-                    return session_data
+                # 显示翻译器统计信息
+                if hasattr(translator, 'get_translation_stats'):
+                    st.info("📊 使用新一代上下文感知翻译引擎")
+                else:
+                    st.info("📊 使用传统GPT翻译引擎")
                 
-                from translation.translator import Translator
-                translator = Translator(self.config)
+                # 转换为适合翻译的格式
+                segments_for_translation = []
+                for seg in confirmed_segments:
+                    if isinstance(seg, SegmentDTO):
+                        # 对于新的上下文翻译器，使用简化的字典格式
+                        if hasattr(translator, 'translate_segments_with_context'):
+                            segment_dict = {
+                                'id': seg.id,
+                                'start': seg.start,
+                                'end': seg.end,
+                                'text': seg.original_text,
+                                'duration': seg.target_duration
+                            }
+                        else:
+                            # 传统翻译器使用完整格式
+                            segment_dict = seg.to_legacy_dict()
+                    else:
+                        segment_dict = seg
+                    segments_for_translation.append(segment_dict)
                 
-                # 保存translator实例到session_data以便后续统计
-                session_data['translator_instance'] = translator
-                
-                # 转换为legacy格式进行翻译
-                legacy_segments = [seg.to_legacy_dict() for seg in confirmed_segments]
-                # translated_segments = translator.translate_segments_with_cache(  # 注释掉cache相关
-                #     legacy_segments, target_lang, progress_callback=None
-                # )
-                
-                # 提取文本进行翻译
-                texts_to_translate = [seg.get('confirmed_text', seg.get('text', '')) for seg in legacy_segments]
-                translated_texts = translator.translate_segments(  # 使用无缓存版本
-                    texts_to_translate, target_lang or 'en', progress_callback=None
-                )
-                
-                # 将翻译结果合并回片段
-                translated_segments = []
-                for i, (legacy_seg, translated_text) in enumerate(zip(legacy_segments, translated_texts)):
-                    translated_seg = legacy_seg.copy()
-                    translated_seg['translated_text'] = translated_text
-                    translated_segments.append(translated_seg)
-                
-                # 转换回SegmentDTO格式并更新原对象
-                for i, translated_seg in enumerate(translated_segments):
-                    confirmed_segments[i].translated_text = translated_seg.get('translated_text', '')
-                    confirmed_segments[i].processing_metadata.update(
-                        translated_seg.get('processing_metadata', {})
+                # 根据翻译器类型选择翻译方法
+                if hasattr(translator, 'translate_segments_with_context'):
+                    # 新的上下文感知翻译器
+                    translated_segments = getattr(translator, 'translate_segments_with_context')(
+                        segments_for_translation, target_language
                     )
+                elif hasattr(translator, 'translate_segments_with_cache'):
+                    # 传统翻译器
+                    translated_segments = getattr(translator, 'translate_segments_with_cache')(
+                        segments_for_translation, target_language, progress_callback
+                    )
+                else:
+                    # 最基本的翻译方法
+                    texts = [seg.get('text', '') for seg in segments_for_translation]
+                    translated_texts = getattr(translator, 'translate_segments')(texts, target_language, progress_callback)
+                    translated_segments = []
+                    for i, seg in enumerate(segments_for_translation):
+                        new_seg = seg.copy()
+                        new_seg['translated_text'] = translated_texts[i] if i < len(translated_texts) else seg.get('text', '')
+                        translated_segments.append(new_seg)
                 
-                session_data['validated_segments'] = confirmed_segments
-                session_data['processing_stage'] = 'optimizing'
-                logger.info(f"✅ 翻译完成，直接进入优化阶段: {session_data['processing_stage']}")
-                # 返回数据而不是立即rerun，让数据先被保存
+                # 转换回SegmentDTO格式
+                translated_dto_segments = []
+                for seg in translated_segments:
+                    if isinstance(seg, dict):
+                        dto = SegmentDTO.from_legacy_segment(seg)
+                        # 确保翻译文本被正确设置
+                        if 'translated_text' in seg:
+                            dto.translated_text = seg['translated_text']
+                            dto.final_text = seg['translated_text']  # 直接设置为最终文本，不需要优化
+                    else:
+                        dto = seg
+                    translated_dto_segments.append(dto)
+                
+                # 保存翻译器实例用于统计
+                session_data['translator_instance'] = translator
+                session_data['translated_segments'] = translated_dto_segments
+                
+                progress_bar.progress(100)
+                status_text.text("✅ 翻译完成！")
+                
+                # 直接进入音频确认，跳过优化迭代
+                session_data['processing_stage'] = 'user_confirmation'
+                
+                # 清理进度显示
+                progress_bar.empty()
+                status_text.empty()
+                st.success("✅ 翻译完成！正在跳转到音频确认页面...")
+                
                 return session_data
                 
             except Exception as e:
-                st.error(f"💢 翻译失败: {str(e)}")
-                st.info("请检查API设置和网络连接，然后重试")
+                logger.error(f"❌ 翻译失败: {e}")
+                st.error(f"❌ 翻译失败: {str(e)}")
                 session_data['processing_stage'] = 'language_selection'
         
         return session_data
     
 
     
-    def _render_optimization_progress(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _render_optimization_progress_deprecated(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """渲染优化进度界面"""
         with st.spinner("⏱️ 正在进行时间同步优化..."):
             try:
@@ -390,7 +561,7 @@ class WorkflowManager:
                 
                 from timing.sync_manager import PreciseSyncManager
                 from translation.translator import Translator
-                from tts.azure_tts import AzureTTS
+                from tts import create_tts_engine
                 
                 sync_manager = PreciseSyncManager(self.config, progress_callback=None)
                 
@@ -400,7 +571,7 @@ class WorkflowManager:
                     translator = Translator(self.config)
                     session_data['translator_instance'] = translator
                 
-                tts = AzureTTS(self.config)
+                tts = create_tts_engine(self.config)
                 # 保存tts实例以便后续统计
                 session_data['tts_instance'] = tts
                 
@@ -507,15 +678,104 @@ class WorkflowManager:
     
     def _render_audio_confirmation(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """渲染音频确认界面"""
+        # 支持新的翻译流程（直接来自翻译）和旧的优化流程
+        translated_segments = session_data.get('translated_segments', [])
         optimized_segments = session_data.get('optimized_segments', [])
         confirmation_segments = session_data.get('confirmation_segments', [])
         translated_original_segments = session_data.get('translated_original_segments', [])
         target_lang = session_data.get('target_lang', 'en')
         
-        if not all([optimized_segments, confirmation_segments, translated_original_segments]):
-            st.error("❌ 优化数据丢失，请重新处理")
-            session_data['processing_stage'] = 'language_selection'
-            return session_data
+        # 如果有翻译数据但没有优化数据，直接使用翻译数据
+        if translated_segments and not optimized_segments:
+            logger.info("使用直接翻译数据进行音频确认")
+            
+            # 为翻译段生成音频（如果还没有的话）
+            if not any(seg.audio_data for seg in translated_segments):
+                logger.info("开始为翻译段生成音频...")
+                translated_segments = self._generate_audio_for_segments(translated_segments, target_lang)
+                # 确保TTS实例在session_data中也保存
+                if 'tts_instance' in st.session_state:
+                    session_data['tts_instance'] = st.session_state['tts_instance']
+            
+            # 记录音频数据状态
+            audio_count = sum(1 for seg in translated_segments if seg.audio_data is not None)
+            logger.info(f"翻译段音频状态检查：共{len(translated_segments)}个段，{audio_count}个有音频数据")
+            
+            # 使用翻译段作为确认段（深度复制以确保数据完整性）
+            optimized_segments = translated_segments
+            confirmation_segments = []
+            for seg in translated_segments:
+                # 创建新的SegmentDTO实例确保数据完整性
+                new_seg = SegmentDTO.from_legacy_segment(seg.to_legacy_dict())
+                # 重要：确保音频数据正确复制
+                if seg.audio_data is not None:
+                    new_seg.set_audio_data(seg.audio_data)
+                    logger.debug(f"片段 {seg.id} 音频数据已复制到确认段")
+                else:
+                    logger.warning(f"片段 {seg.id} 缺少音频数据")
+                confirmation_segments.append(new_seg)
+            
+            # 生成原始片段的翻译版本
+            translated_original_segments = self._redistribute_translations(
+                translated_segments, session_data.get('segments', [])
+            )
+            
+            # 更新session_data
+            session_data['optimized_segments'] = optimized_segments
+            session_data['confirmation_segments'] = confirmation_segments
+            session_data['translated_original_segments'] = translated_original_segments
+        
+        # 验证必要数据（改进验证逻辑，避免意外的状态回退）
+        missing_data = []
+        if not optimized_segments:
+            missing_data.append("优化片段")
+        if not confirmation_segments:
+            missing_data.append("确认片段")
+        if not translated_original_segments:
+            missing_data.append("翻译原始片段")
+        
+        if missing_data:
+            logger.warning(f"音频确认阶段缺少数据: {', '.join(missing_data)}")
+            st.warning(f"⚠️ 缺少以下数据: {', '.join(missing_data)}")
+            
+            # 如果有翻译数据，尝试重新构建缺少的数据
+            if translated_segments:
+                logger.info("尝试从翻译数据重新构建缺少的数据...")
+                
+                if not optimized_segments:
+                    optimized_segments = translated_segments
+                    session_data['optimized_segments'] = optimized_segments
+                    logger.info("已从翻译数据重建优化片段")
+                
+                if not confirmation_segments:
+                    confirmation_segments = []
+                    for seg in translated_segments:
+                        new_seg = SegmentDTO.from_legacy_segment(seg.to_legacy_dict())
+                        if seg.audio_data is not None:
+                            new_seg.set_audio_data(seg.audio_data)
+                        confirmation_segments.append(new_seg)
+                    session_data['confirmation_segments'] = confirmation_segments
+                    logger.info("已从翻译数据重建确认片段")
+                
+                if not translated_original_segments:
+                    translated_original_segments = self._redistribute_translations(
+                        translated_segments, session_data.get('segments', [])
+                    )
+                    session_data['translated_original_segments'] = translated_original_segments
+                    logger.info("已重建翻译原始片段")
+            else:
+                # 如果连翻译数据都没有，才回退到语言选择
+                st.error("❌ 关键翻译数据丢失，需要重新处理")
+                session_data['processing_stage'] = 'language_selection'
+                return session_data
+        
+        # 验证音频数据完整性
+        audio_missing_count = sum(1 for seg in confirmation_segments if seg.audio_data is None)
+        if audio_missing_count > 0:
+            logger.warning(f"警告：{audio_missing_count}/{len(confirmation_segments)} 个确认片段缺少音频数据")
+            st.warning(f"⚠️ 发现 {audio_missing_count} 个片段缺少音频数据，系统将在确认时自动生成")
+        else:
+            logger.info(f"✅ 所有 {len(confirmation_segments)} 个确认片段都有音频数据")
         
         # 使用音频确认组件
         result = self.audio_confirmation_view.render(
@@ -586,136 +846,6 @@ class WorkflowManager:
         
         return session_data
     
-    # def _restore_cache_data(self, selected_cache: Dict[str, Any], 
-    #                        progress_bar, status_text) -> Dict[str, Any]:
-    #     """恢复缓存数据并转换为SegmentDTO格式"""
-    #     restored_data = {}
-    #     
-    #     # 恢复分段数据
-    #     if "segmentation" in selected_cache and selected_cache.get("segmentation"):
-    #         progress_bar.progress(25)
-    #         status_text.text("正在恢复分段数据...")
-    #             
-    #         segmentation_data = selected_cache["segmentation"]
-    #             
-    #         if "original_segments" in segmentation_data:
-    #             restored_data['segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg) 
-    #                 for seg in segmentation_data["original_segments"]
-    #             ]
-    #             
-    #         if "confirmed_segments" in segmentation_data:
-    #             restored_data['confirmed_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg) 
-    #                 for seg in segmentation_data["confirmed_segments"]
-    #             ]
-    #     
-    #     # 恢复翻译数据
-    #     if "translation" in selected_cache and selected_cache.get("translation"):
-    #         progress_bar.progress(50)
-    #         status_text.text("正在恢复翻译数据...")
-    #             
-    #         translation_data = selected_cache["translation"]
-    #             
-    #         if "translated_segments" in translation_data:
-    #             restored_data['translated_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg)
-    #                 for seg in translation_data["translated_segments"]
-    #             ]
-    #             
-    #         if "validated_segments" in translation_data:
-    #             restored_data['validated_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg)
-    #                 for seg in translation_data["validated_segments"]
-    #             ]
-    #     
-    #     # 恢复确认数据
-    #     if "confirmation" in selected_cache and selected_cache.get("confirmation"):
-    #         progress_bar.progress(75)
-    #         status_text.text("正在恢复确认数据...")
-    #             
-    #         confirmation_data = selected_cache["confirmation"]
-    #             
-    #         if "optimized_segments" in confirmation_data:
-    #             restored_data['optimized_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg)
-    #                 for seg in confirmation_data["optimized_segments"]
-    #             ]
-    #             
-    #         if "confirmation_segments" in confirmation_data:
-    #             restored_data['confirmation_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg)
-    #                 for seg in confirmation_data["confirmation_segments"]
-    #             ]
-    #             
-    #         if "translated_original_segments" in confirmation_data:
-    #             restored_data['translated_original_segments'] = [
-    #                 SegmentDTO.from_legacy_segment(seg)
-    #                 for seg in confirmation_data["translated_original_segments"]
-    #             ]
-    #     
-    #     # 恢复目标语言
-    #     if "target_lang" in selected_cache:
-    #         restored_data['target_lang'] = selected_cache["target_lang"]
-    #     
-    #     progress_bar.progress(100)
-    #     status_text.text("缓存数据恢复完成！")
-    #     
-    #     return restored_data
-    
-    # def _determine_next_stage_from_cache(self, restored_data: Dict[str, Any]) -> str:
-    #     """根据恢复的数据确定下一个阶段"""
-    #     if restored_data.get('optimized_segments'):
-    #         return 'user_confirmation'
-    #     elif restored_data.get('validated_segments'):
-    #         return 'translation_validation'
-    #     elif restored_data.get('translated_segments'):
-    #         return 'translation_validation'
-    #     elif restored_data.get('confirmed_segments'):
-    #         return 'language_selection'
-    #     else:
-    #         return 'initial'
-    
-    # def _save_segmentation_cache(self, session_data: Dict[str, Any], 
-    #                             confirmed_segments: List[SegmentDTO]):
-    #     """保存分段缓存"""
-    #     try:
-    #         input_file_path = session_data.get('input_file_path')
-    #         if input_file_path:
-    #             from utils.cache_integration import get_cache_integration
-    #             cache_integration = get_cache_integration()
-    #             
-    #             original_segments = session_data.get('segments', [])
-    #             cache_integration.save_confirmed_segmentation_cache(
-    #                 input_file_path, 
-    #                 [seg.to_legacy_dict() for seg in confirmed_segments],
-    #                 [seg.to_legacy_dict() for seg in original_segments]
-    #             )
-    #             st.success("💾 分段结果已缓存")
-    #     except Exception as e:
-    #         logger.warning(f"保存分段缓存失败: {e}")
-    
-    # def _save_translation_cache(self, session_data: Dict[str, Any], 
-    #                            validated_segments: List[SegmentDTO], target_lang: str):
-    #     """保存翻译缓存"""
-    #     try:
-    #         input_file_path = session_data.get('input_file_path')
-    #         if input_file_path:
-    #             from utils.cache_integration import get_cache_integration
-    #             cache_integration = get_cache_integration()
-    #             
-    #             translation_data = {
-    #                 "translated_segments": [seg.to_legacy_dict() for seg in validated_segments],
-    #                 "validated_segments": [seg.to_legacy_dict() for seg in validated_segments],
-    #                 "translated_original_segments": [seg.to_legacy_dict() for seg in validated_segments],
-    #                 "translation_timestamp": __import__('time').time(),
-    #                 "is_user_confirmed": True
-    #             }
-    #             
-    #             cache_integration.save_translation_cache(input_file_path, target_lang, translation_data)
-    #             st.success("💾 翻译结果已缓存")
-    #     except Exception as e:
-    #         logger.warning(f"保存翻译缓存失败: {e}")
     
     def _redistribute_translations(self, translated_segments: List[SegmentDTO], 
         original_segments: List[SegmentDTO]) -> List[SegmentDTO]:
@@ -739,17 +869,44 @@ class WorkflowManager:
         """生成最终音频"""
         try:
             from timing.audio_synthesizer import AudioSynthesizer
-            from tts.azure_tts import AzureTTS
+            from tts import create_tts_engine
             
             audio_synthesizer = AudioSynthesizer(self.config)
             
+            # 获取用户选择的TTS服务
+            selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+            selected_voice_id = st.session_state.get('selected_voice_id')
+            
             # 优先使用已保存的tts实例以保持统计连续性
-            tts = session_data.get('tts_instance')
-            if not tts:
-                tts = AzureTTS(self.config)
+            tts = session_data.get('tts_instance') or st.session_state.get('tts_instance')
+            current_service = st.session_state.get('current_tts_service')
+            
+            # 检查是否需要重新创建TTS引擎（服务类型变更）
+            if not tts or current_service != selected_tts_service:
+                logger.info(f"创建TTS引擎用于最终音频: {selected_tts_service}")
+                tts = create_tts_engine(self.config, selected_tts_service)
                 session_data['tts_instance'] = tts
+                st.session_state['tts_instance'] = tts
+                st.session_state['current_tts_service'] = selected_tts_service
+            
+            # 如果是ElevenLabs且用户选择了特定音色，设置它
+            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                tts.set_voice(selected_voice_id)
             
             target_lang = session_data.get('target_lang', 'en')
+            
+            # 在转换前验证确认片段的音频数据
+            audio_available_count = sum(1 for seg in confirmed_segments if seg.audio_data is not None)
+            confirmed_count = sum(1 for seg in confirmed_segments if seg.confirmed)
+            logger.info(f"最终音频生成前验证：{len(confirmed_segments)}个片段，{confirmed_count}个已确认，{audio_available_count}个有音频数据")
+            
+            if audio_available_count == 0:
+                logger.error("❌ 所有确认片段都没有音频数据！")
+                st.error("❌ 无法生成最终音频：所有片段都缺少音频数据")
+                return
+            elif audio_available_count < confirmed_count:
+                logger.warning(f"⚠️ {confirmed_count - audio_available_count}个已确认片段缺少音频数据")
+                st.warning(f"⚠️ {confirmed_count - audio_available_count}个已确认片段缺少音频数据，将在最终音频中显示为静音")
             
             # 转换为legacy格式
             legacy_segments = [seg.to_legacy_dict() for seg in confirmed_segments]
@@ -761,7 +918,29 @@ class WorkflowManager:
             audio_output = f"dubbed_audio_{target_lang}.wav"
             subtitle_output = f"translated_subtitle_{target_lang}.srt"
             
-            final_audio.export(audio_output, format="wav")
+            # Windows系统优化的音频导出
+            import platform
+            from pathlib import Path
+            from utils.windows_audio_utils import get_windows_audio_utils, is_windows
+            
+            if is_windows():
+                # 使用Windows音频工具进行安全导出
+                windows_utils = get_windows_audio_utils()
+                output_path = Path(audio_output)
+                
+                if windows_utils.safe_export_audio(final_audio, output_path):
+                    logger.info(f"Windows系统音频导出完成: {audio_output}")
+                else:
+                    raise Exception(f"Windows音频导出失败: {audio_output}")
+            else:
+                # 非Windows系统使用原有逻辑
+                final_audio.export(audio_output, format="wav")
+                logger.info(f"音频导出完成: {audio_output}")
+                
+                # 验证输出文件
+                output_path = Path(audio_output)
+                if not output_path.exists() or output_path.stat().st_size == 0:
+                    raise Exception(f"最终音频文件创建失败或为空: {audio_output}")
             
             # 保存字幕
             from audio_processor.subtitle_processor import SubtitleProcessor
@@ -849,7 +1028,7 @@ class WorkflowManager:
             logger.error(f"生成最终音频失败: {e}")
     
     def _reset_all_states(self, session_data: Dict[str, Any]):
-        """重置所有状态"""
+        """重置所有状态（修复版本 - 不破坏已完成的工程）"""
         # 清理临时文件
         input_file_path = session_data.get('input_file_path')
         if input_file_path and Path(input_file_path).exists():
@@ -859,9 +1038,12 @@ class WorkflowManager:
             except Exception as e:
                 logger.warning(f"清理临时文件失败: {e}")
         
-        # 重置所有状态
+        # 获取当前工程信息（重要：在清理前保存）
+        current_project = session_data.get('current_project')
+        
+        # 重置会话数据，但保护工程状态
         keys_to_reset = [
-            'processing_stage', 'segments', 'segmented_segments', 
+            'segments', 'segmented_segments', 
             'confirmed_segments', 'target_lang', 'config', 'input_file_path',
             'completion_results', 'optimized_segments', 'confirmation_segments',
             'translated_original_segments', 'translated_segments', 'validated_segments',
@@ -871,5 +1053,28 @@ class WorkflowManager:
         for key in keys_to_reset:
             session_data.pop(key, None)
         
-        # 重置为初始状态
-        session_data['processing_stage'] = 'file_upload' 
+        # 重要：完全清除工程关联，避免状态损坏
+        if current_project:
+            logger.info(f"清除工程关联: {getattr(current_project, 'name', '未知')}")
+            # 不保存current_project的任何变化，避免污染工程数据
+            session_data.pop('current_project', None)
+        
+        # 重置到工程管理首页（不关联任何具体工程）
+        # 注意：不要保存这个状态到工程中！
+        session_data['processing_stage'] = 'project_home'
+        
+        logger.info("用户选择重新开始 - 已重置会话状态，返回工程管理页面")
+    
+    def _auto_save_project_progress(self, session_data: Dict[str, Any]):
+        """自动保存工程进度"""
+        try:
+            current_project = session_data.get('current_project')
+            if current_project and isinstance(current_project, ProjectDTO):
+                # 保存工程状态
+                success = self.project_integration.save_project_state(current_project, session_data)
+                if success:
+                    logger.debug(f"工程进度自动保存成功: {current_project.name}")
+                else:
+                    logger.warning(f"工程进度自动保存失败: {current_project.name}")
+        except Exception as e:
+            logger.warning(f"自动保存工程进度失败: {e}") 

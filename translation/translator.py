@@ -4,7 +4,7 @@
 支持高性能并发翻译
 """
 
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI
 from typing import List, Dict, Any, Optional
 from loguru import logger
 import re
@@ -47,7 +47,7 @@ class Translator:
             logger.info(f"使用OpenAI API，模型: {self.model}")
         
         self.temperature = self.translation_config.get('temperature', 0.3)
-        self.system_prompt = self.translation_config.get('system_prompt', '你是一个专业的翻译专家，擅长将中文文本翻译为其他语言。')
+        self.system_prompt = self.translation_config.get('system_prompt', '你是一个专业的翻译专家，擅长将各种语言的文本翻译为其他语言。')
         
         # 创建客户端
         if self.use_kimi:
@@ -96,6 +96,23 @@ class Translator:
             'cache_hits': 0,
             'session_start_time': time.time()
         }
+        
+        # 字符数统计和费用计算
+        self.character_stats = {
+            'total_input_characters': 0,
+            'total_output_characters': 0,
+            'session_start_time': time.time()
+        }
+        
+        # API定价（USD）
+        if self.use_kimi:
+            # Kimi API定价：输入$0.25/M tokens，输出$1.0/M tokens
+            self.input_cost_per_token = 0.00000025  # $0.25/1M tokens
+            self.output_cost_per_token = 0.000001   # $1.0/1M tokens
+        else:
+            # GPT-4o定价：输入$2.5/M tokens，输出$10/M tokens
+            self.input_cost_per_token = 0.0000025   # $2.5/1M tokens  
+            self.output_cost_per_token = 0.00001    # $10/1M tokens
 
         # 获取全局缓存实例
         self.cache_manager = get_cache_manager()
@@ -552,6 +569,14 @@ class Translator:
                 self.token_stats['total_completion_tokens'] += response.usage.completion_tokens
                 self.token_stats['total_requests'] += 1
                 
+                # 统计字符数（用于费用计算的一致性）
+                input_chars = len(prompt) + len(self.system_prompt)
+                output_chars = 0
+                if response.choices and response.choices[0].message.content:
+                    output_chars = len(response.choices[0].message.content)
+                self.character_stats['total_input_characters'] += input_chars
+                self.character_stats['total_output_characters'] += output_chars
+                
                 logger.debug(f"Token使用: prompt={response.usage.prompt_tokens}, "
                            f"completion={response.usage.completion_tokens}, "
                            f"total={response.usage.total_tokens}")
@@ -749,7 +774,7 @@ class Translator:
         """
         language_name = self.language_names.get(target_language, target_language)
         
-        prompt = f"""请将以下中文文本翻译成{language_name}，要求：
+        prompt = f"""请将以下文本翻译成{language_name}，要求：
 1. 用最日常、最口语化的表达方式
 2. 就像{language_name}当地人平时聊天时会说的话
 3. 考虑时间约束({duration:.2f}秒)，用简洁有力的表达
@@ -763,7 +788,7 @@ class Translator:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "你是一个短视频配音翻译师，擅长将内容转化为日常口语化的表达。"},
+                {"role": "system", "content": "你是一个短视频配音翻译师，擅长将各种语言的内容转化为日常口语化的表达。"},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=500,
@@ -900,6 +925,14 @@ class Translator:
         avg_tokens_per_request = total_tokens / max(1, self.token_stats['total_requests'])
         session_duration = time.time() - self.token_stats['session_start_time']
         
+        # 计算费用
+        input_cost = self.token_stats['total_prompt_tokens'] * self.input_cost_per_token
+        output_cost = self.token_stats['total_completion_tokens'] * self.output_cost_per_token
+        total_cost = input_cost + output_cost
+        
+        # 获取字符数统计
+        total_chars = self.character_stats['total_input_characters'] + self.character_stats['total_output_characters']
+        
         stats = {
             'total_prompt_tokens': self.token_stats['total_prompt_tokens'],
             'total_completion_tokens': self.token_stats['total_completion_tokens'],
@@ -910,7 +943,15 @@ class Translator:
             'cache_hit_rate': round(self.token_stats['cache_hits'] / max(1, self.token_stats['total_requests']) * 100, 2),
             'session_duration_minutes': round(session_duration / 60, 2),
             'tokens_per_minute': round(total_tokens / max(1, session_duration / 60), 2),
-            'requests_per_minute': round(self.token_stats['total_requests'] / max(1, session_duration / 60), 2)
+            'requests_per_minute': round(self.token_stats['total_requests'] / max(1, session_duration / 60), 2),
+            # 新增字符数和费用统计
+            'total_characters': total_chars,
+            'input_characters': self.character_stats['total_input_characters'],
+            'output_characters': self.character_stats['total_output_characters'],
+            'estimated_cost_usd': total_cost,
+            'input_cost_usd': input_cost,
+            'output_cost_usd': output_cost,
+            'avg_characters_per_request': round(total_chars / max(1, self.token_stats['total_requests']), 2)
         }
         
         # 如果使用Kimi API，添加限制比较
@@ -939,6 +980,13 @@ class Translator:
             'total_completion_tokens': 0,
             'total_requests': 0,
             'cache_hits': 0,
+            'session_start_time': time.time()
+        }
+        
+        # 重置字符数统计
+        self.character_stats = {
+            'total_input_characters': 0,
+            'total_output_characters': 0,
             'session_start_time': time.time()
         } 
 

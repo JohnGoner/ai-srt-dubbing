@@ -68,8 +68,8 @@ class SegmentDTO:
         if not self.text and self.original_text:
             self.text = self.original_text
         
-        # 确保original_indices存在且为列表
-        if not hasattr(self, 'original_indices') or not isinstance(self.original_indices, list):
+        # 确保original_indices存在且为列表（修复兼容性问题）
+        if not hasattr(self, 'original_indices') or not isinstance(getattr(self, 'original_indices', None), list):
             self.original_indices = []
         
         # 修改：更明确的final_text设置逻辑

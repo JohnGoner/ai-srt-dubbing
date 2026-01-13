@@ -1,6 +1,6 @@
 """
 时间同步管理模块 - 精确模式
-专注于LLM文本精简 + Azure API微调语速实现精确时间同步
+专注于LLM文本精简 + TTS API微调语速实现精确时间同步
 """
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -186,7 +186,7 @@ class PreciseSyncManager:
         import threading
         
         # 根据API限制和片段数量确定合适的并发数
-        # Azure TTS每分钟150次请求，考虑安全裕度使用较小的并发数
+        # MiniMax TTS每分钟限制，考虑安全裕度使用较小的并发数
         max_workers = min(8, len(segments), max(2, len(segments) // 5))
         
         audio_segments = []

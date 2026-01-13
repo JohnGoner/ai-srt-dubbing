@@ -9,6 +9,7 @@ import os
 from typing import List, Dict, Any
 from loguru import logger
 from models.segment_dto import SegmentDTO
+from translation.text_optimizer import TextOptimizer
 
 
 class AudioConfirmationView:
@@ -23,7 +24,7 @@ class AudioConfirmationView:
                translated_original_segments: List[SegmentDTO], 
         target_lang: str, config: Dict[str, Any]) -> Dict[str, Any]:
         """
-        渲染音频确认界面
+        渲染音频确认界面 (极简设计)
         
         Args:
             optimized_segments: 优化后的片段
@@ -35,21 +36,33 @@ class AudioConfirmationView:
         Returns:
             包含action和数据的结果字典
         """
-        st.markdown("## 🎵 Step 4: 翻译文本确认与音频预览")
-        st.markdown("请确认每个片段的翻译文本和音频效果，可以修改文本并重新生成音频。")
+        st.markdown('<div class="main-header"><h1>音频预览与确认</h1></div>', unsafe_allow_html=True)
+        
+        # 确保segments按正确顺序排序（按start时间排序）
+        if confirmation_segments:
+            confirmation_segments.sort(key=lambda seg: (seg.start, seg.id))
+            logger.info(f"已对 {len(confirmation_segments)} 个确认片段按时间排序")
+        
+        # 显示总体统计 (极简版)
+        self._display_overall_stats_minimal(confirmation_segments)
         
         # 当前片段详情
         if confirmation_segments:
             self._display_current_segment(confirmation_segments, target_lang)
         
-        # 显示总体统计
-        self._display_overall_stats(confirmation_segments)
-        
-        # 片段导航
-        # self._display_segment_navigation(confirmation_segments)
-        
         # 确认完成按钮
         return self._render_action_buttons(confirmation_segments, translated_original_segments, optimized_segments, target_lang)
+
+    def _display_overall_stats_minimal(self, confirmation_segments: List[SegmentDTO]):
+        """显示极简统计信息"""
+        if not confirmation_segments:
+            return
+        
+        total = len(confirmation_segments)
+        confirmed = sum(1 for seg in confirmation_segments if seg.confirmed)
+        avg_error = sum(seg.timing_error_ms or 0 for seg in confirmation_segments) / total
+        
+        st.caption(f"总片段: {total} | 已确认: {confirmed}/{total} | 平均误差: {avg_error:.0f}ms")
     
     def _display_overall_stats(self, confirmation_segments: List[SegmentDTO]):
         """显示总体统计信息"""
@@ -202,24 +215,34 @@ class AudioConfirmationView:
                 # 清除重置标记和旧的文本状态
                 if reset_key in st.session_state:
                     del st.session_state[reset_key]
-                if text_key in st.session_state:
-                    del st.session_state[text_key]
+                manual_text_key = f"manual_text_{current_segment.id}"
+                if manual_text_key in st.session_state:
+                    del st.session_state[manual_text_key]
                 logger.debug(f"重置片段 {current_segment.id} 的文本输入框")
             
-            # 初始化文本状态（如果不存在）
-            if text_key not in st.session_state:
-                st.session_state[text_key] = current_segment_text
-                logger.debug(f"初始化片段 {current_segment.id} 的文本: {current_segment_text[:50]}...")
+            # 使用不同的策略：不使用key参数，而是手动管理状态
+            # 这样可以避免Streamlit的value/key冲突
+            manual_text_key = f"manual_text_{current_segment.id}"
             
-            # 创建文本输入框
+            # 获取当前文本框应该显示的内容
+            if manual_text_key in st.session_state:
+                display_text = st.session_state[manual_text_key]
+            else:
+                display_text = current_segment_text
+                st.session_state[manual_text_key] = display_text
+            
+            # 创建文本输入框（不使用key参数）
             new_text = st.text_area(
                 "优化翻译", 
-                value=st.session_state[text_key], 
+                value=display_text,
                 height=120, 
-                key=text_key,
                 label_visibility="collapsed",
                 help="修改文本后点击「重新生成音频」按钮应用更改"
             )
+            
+            # 手动更新session_state
+            if new_text != display_text:
+                st.session_state[manual_text_key] = new_text
             
             # 确保new_text不为None
             if new_text is None:
@@ -249,7 +272,7 @@ class AudioConfirmationView:
         
         # 操作按钮
         st.markdown("---")
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             # 简化按钮逻辑，统一使用"重新生成音频"
@@ -263,6 +286,17 @@ class AudioConfirmationView:
                 self._regenerate_segment_audio(current_segment, target_lang, current_index)
 
         with col2:
+            # 智能文本优化按钮
+            if st.button(
+                "🎯 智能优化文本",
+                key=f"optimize_text_{current_index}",
+                type="secondary",
+                help="基于时长差距自动优化翻译文本",
+                use_container_width=True
+            ):
+                self._optimize_segment_text(current_segment, target_lang, current_index)
+
+        with col3:
             # 由于st.button的type只支持primary/secondary/tertiary，使用primary高亮确认按钮
             if current_segment.confirmed:
                 if st.button(
@@ -281,8 +315,28 @@ class AudioConfirmationView:
                     type="primary",
                     use_container_width=True
                 ):
-                    current_segment.confirmed = True
-                    st.success("片段已确认！")
+                    # 重要：确认前检查音频数据
+                    if current_segment.audio_data is None:
+                        st.warning("⚠️ 该片段缺少音频数据，正在自动生成...")
+                        logger.warning(f"片段 {current_segment.id} 缺少音频数据，自动生成中")
+                        
+                        # 自动生成音频数据
+                        try:
+                            self._regenerate_segment_audio(current_segment, target_lang, current_index)
+                            if current_segment.audio_data is not None:
+                                current_segment.confirmed = True
+                                st.success("✅ 音频已生成并确认片段！")
+                            else:
+                                st.error("❌ 音频生成失败，无法确认片段")
+                                return  # 不执行后续的跳转逻辑
+                        except Exception as e:
+                            logger.error(f"自动生成音频失败: {e}")
+                            st.error(f"❌ 自动生成音频失败: {str(e)}")
+                            return  # 不执行后续的跳转逻辑
+                    else:
+                        # 音频数据存在，直接确认
+                        current_segment.confirmed = True
+                        st.success("✅ 片段已确认！")
                     
                     # 智能跳转到下一个未确认的片段
                     total_segments = len(confirmation_segments)
@@ -415,7 +469,10 @@ class AudioConfirmationView:
         # 获取固定的语速信息
         current_rate: float = segment.speech_rate or 1.0  # 当前音频的语速，固定值
         target_duration: float = getattr(segment, "target_duration", 0) or 1.0
-        actual_duration: float = getattr(segment, "actual_duration", 0)
+        
+        # 安全获取实际时长，处理 None 的情况
+        actual_duration_raw = getattr(segment, "actual_duration", 0)
+        actual_duration: float = float(actual_duration_raw) if actual_duration_raw is not None else 0.0
 
         # 计算建议语速（基于当前音频时长），固定值
         if actual_duration > 0 and target_duration > 0:
@@ -482,15 +539,16 @@ class AudioConfirmationView:
 
         with col3:
             # 语速调节滑块
-            new_rate = st.slider(
+            st.slider(
                 "下次生成语速",
                 min_value=0.95,
                 max_value=1.15,
-                value=user_rate,
                 step=0.01,
                 key=slider_key,
                 help="调整下次重新生成音频时使用的语速"
             )
+            # 读取最新的用户选择值，避免使用渲染前的旧值
+            user_rate = st.session_state[slider_key]
             
             # 快速设置按钮
             if abs(suggested_rate - current_rate) > 0.02 and abs(suggested_rate - user_rate) > 0.01:
@@ -528,26 +586,47 @@ class AudioConfirmationView:
             try:
                 import tempfile
                 import os
+                from utils.windows_audio_utils import get_windows_audio_utils, is_windows
                 
-                 
-                # 创建临时音频文件
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-                    # 导出音频到临时文件
-                    segment.audio_data.export(tmp_file.name, format='wav')
-                    tmp_path = tmp_file.name
-                
-                # 显示音频播放器
-                with open(tmp_path, 'rb') as audio_file:
-                    audio_bytes = audio_file.read()
-                    st.audio(audio_bytes, format='audio/wav')
-                
-                
-                # 清理临时文件
-                try:
-                    os.unlink(tmp_path)
-                except Exception as e:
-                    logger.warning(f"清理临时文件失败: {e}")
+                # 使用Windows音频工具进行优化处理
+                if is_windows():
+                    # Windows系统使用专用工具
+                    windows_utils = get_windows_audio_utils()
+                    tmp_path = windows_utils.create_temp_audio_path("preview", segment.id)
                     
+                    # 安全导出音频文件
+                    if windows_utils.safe_export_audio(segment.audio_data, tmp_path):
+                        # 读取音频文件内容
+                        with open(tmp_path, 'rb') as audio_file:
+                            audio_bytes = audio_file.read()
+                        
+                        # 显示音频播放器
+                        st.audio(audio_bytes, format='audio/wav')
+                        
+                        # 安全清理临时文件
+                        windows_utils.safe_cleanup_file(tmp_path)
+                        
+                    else:
+                        raise Exception("Windows音频文件导出失败")
+                
+                else:
+                    # 非Windows系统使用原有逻辑
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                        # 导出音频到临时文件
+                        segment.audio_data.export(tmp_file.name, format='wav')
+                        tmp_path = tmp_file.name
+                    
+                    # 显示音频播放器
+                    with open(tmp_path, 'rb') as audio_file:
+                        audio_bytes = audio_file.read()
+                        st.audio(audio_bytes, format='audio/wav')
+                    
+                    # 清理临时文件
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception as e:
+                        logger.warning(f"清理临时文件失败: {e}")
+                        
             except Exception as e:
                 st.error(f"❌ 音频预览失败: {str(e)}")
                 logger.error(f"音频预览失败: {e}")
@@ -558,7 +637,9 @@ class AudioConfirmationView:
                     st.write("**可能的解决方案:**")
                     st.write("1. 重新生成此片段的音频")
                     st.write("2. 检查音频数据是否完整") 
-                    st.write("3. 联系技术支持")
+                    st.write("3. 检查临时目录权限（Windows系统）")
+                    st.write("4. 重启应用程序清理文件锁定")
+                    st.write("5. 联系技术支持")
                     
         else:
             st.warning("⚠️ 音频数据不可用")
@@ -567,18 +648,31 @@ class AudioConfirmationView:
     def _regenerate_segment_audio(self, segment: SegmentDTO, target_lang: str, segment_index: int):
         """重新生成片段音频"""
         try:
-            # 从session_state获取TTS实例
-            tts = st.session_state.get('tts')
-            if not tts:
-                from tts.azure_tts import AzureTTS
-                config = st.session_state.get('config', {})
-                tts = AzureTTS(config)
-                st.session_state['tts'] = tts
+            from tts import create_tts_engine
+            
+            # 获取用户选择的TTS服务和音色
+            selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+            selected_voice_id = st.session_state.get('selected_voice_id')
+            config = st.session_state.get('config', {})
+            
+            # 检查TTS实例是否需要重新创建（服务类型变更）
+            tts = st.session_state.get('tts_instance')
+            current_service = st.session_state.get('current_tts_service')
+            
+            if not tts or current_service != selected_tts_service:
+                logger.info(f"重新生成音频时创建TTS引擎: {selected_tts_service}")
+                tts = create_tts_engine(config, selected_tts_service)
+                st.session_state['tts_instance'] = tts
+                st.session_state['current_tts_service'] = selected_tts_service
+            
+            # 如果是ElevenLabs且用户选择了特定音色，设置它
+            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                tts.set_voice(selected_voice_id)
             
             # 获取用户在文本框中输入的最新文本
-            text_key = f"text_edit_{segment.id}"
-            current_text = st.session_state.get(text_key, segment.get_current_text())
-            logger.info(f"重新生成音频 - 片段 {segment.id}: session_state文本='{current_text[:50]}...', segment文本='{segment.get_current_text()[:50]}...'")
+            manual_text_key = f"manual_text_{segment.id}"
+            current_text = st.session_state.get(manual_text_key, segment.get_current_text())
+            logger.info(f"重新生成音频 - 片段 {segment.id}: TTS服务={selected_tts_service}, session_state文本='{current_text[:50]}...', segment文本='{segment.get_current_text()[:50]}...'")
             
             if not current_text.strip():
                 st.error("❌ 文本内容为空，无法生成音频")
@@ -589,11 +683,18 @@ class AudioConfirmationView:
             user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             
             # 显示生成进度
-            with st.spinner(f"🔄 正在重新生成片段 {segment.id} 的音频..."):
-                # 生成新音频
-                voice_name = tts.voice_map.get(target_lang)
+            with st.spinner(f"🔄 正在使用 {selected_tts_service.upper()} 重新生成片段 {segment.id} 的音频..."):
+                # 获取音色ID
+                if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                    voice_name = selected_voice_id
+                else:
+                    voice_name = tts.voice_map.get(target_lang) if hasattr(tts, 'voice_map') else None
+                    # 对于ElevenLabs，如果voice_map是嵌套字典，需要获取第一个音色
+                    if isinstance(voice_name, dict):
+                        voice_name = list(voice_name.keys())[0] if voice_name else None
+                
                 if not voice_name:
-                    st.error(f"❌ 不支持的语言: {target_lang}")
+                    st.error(f"❌ 未配置语言 {target_lang} 的音色")
                     return
                 
                 new_audio_data = tts._generate_single_audio(
@@ -659,7 +760,7 @@ class AudioConfirmationView:
             with st.expander("🔍 错误详情"):
                 st.code(str(e))
                 st.write("**可能的解决方案:**")
-                st.write("1. 检查网络连接和Azure TTS服务状态")
+                st.write("1. 检查网络连接和TTS服务状态")
                 st.write("2. 验证API密钥是否有效且有足够配额")
                 st.write("3. 检查文本长度是否合理（建议少于500字符）")
                 st.write("4. 尝试稍后重试，可能是服务临时不可用")
@@ -813,6 +914,109 @@ class AudioConfirmationView:
                 }
         
         return {'action': 'none'}
+    
+    def _optimize_segment_text(self, segment: SegmentDTO, target_lang: str, segment_index: int):
+        """使用LLM优化片段文本以匹配目标时长"""
+        try:
+            # 检查是否有足够的数据进行优化
+            if not segment.actual_duration or not segment.target_duration:
+                st.warning("⚠️ 缺少时长数据，无法进行智能优化。请先生成音频。")
+                return
+            
+            # 计算时长差距
+            duration_diff = segment.actual_duration - segment.target_duration
+            duration_diff_ms = abs(duration_diff) * 1000
+            
+            # 如果差距很小，不需要优化
+            if duration_diff_ms < 100:
+                st.info("✅ 当前时长已经很接近目标时长，无需优化")
+                return
+            
+            # 获取配置
+            config = st.session_state.get('config', {})
+            if not config:
+                st.error("❌ 配置信息不可用")
+                return
+            
+            # 显示优化进度
+            with st.spinner(f"🎯 正在智能优化文本（目标{'缩短' if duration_diff > 0 else '延长'}{duration_diff_ms:.0f}ms）..."):
+                # 创建文本优化器
+                optimizer = TextOptimizer(config)
+                
+                # 获取当前文本
+                manual_text_key = f"manual_text_{segment.id}"
+                current_text = st.session_state.get(manual_text_key, segment.get_current_text())
+                
+                # 获取原始文本
+                original_text = segment.original_text or segment.translated_text or current_text
+                
+                # 调用优化器
+                optimized_text = optimizer.optimize_text_for_duration(
+                    original_text=original_text,
+                    current_text=current_text,
+                    target_duration=segment.target_duration,
+                    actual_duration=segment.actual_duration,
+                    target_language=target_lang,
+                    original_language='zh'
+                )
+                
+                if optimized_text and optimized_text != current_text:
+                    # 更新文本框内容
+                    st.session_state[manual_text_key] = optimized_text
+                    
+                    # 更新segment的文本
+                    segment.update_final_text(optimized_text)
+                    
+                    # 标记为用户修改
+                    segment.user_modified = True
+                    
+                    # 计算文本变化统计
+                    original_words = len(current_text.split()) if current_text else 0
+                    optimized_words = len(optimized_text.split()) if optimized_text else 0
+                    word_diff = optimized_words - original_words
+                    
+                    action_desc = "增加" if word_diff > 0 else "减少"
+                    word_diff_abs = abs(word_diff)
+                    
+                    st.success(f"✅ 文本优化成功！{action_desc}了{word_diff_abs}个词，预计{'延长' if word_diff > 0 else '缩短'}时长")
+                    
+                    # 显示优化对比
+                    with st.expander("📝 优化对比", expanded=True):
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.markdown("**优化前:**")
+                            st.text_area("优化前文本", value=current_text, height=100, key=f"before_{segment_index}", disabled=True, label_visibility="collapsed")
+                            st.caption(f"词数: {original_words}")
+                        
+                        with col2:
+                            st.markdown("**优化后:**")
+                            st.text_area("优化后文本", value=optimized_text, height=100, key=f"after_{segment_index}", disabled=True, label_visibility="collapsed")
+                            st.caption(f"词数: {optimized_words} ({'+'if word_diff > 0 else ''}{word_diff})")
+                    
+                    st.info("💡 文本已更新到编辑框中，请点击「重新生成音频」按钮应用更改")
+                    
+                    # 自动刷新界面以显示更新后的文本
+                    st.rerun()
+                    
+                elif optimized_text == current_text:
+                    st.info("ℹ️ 当前文本已经是最优状态，无需调整")
+                else:
+                    st.error("❌ 文本优化失败，请检查网络连接和API配置")
+                    
+        except Exception as e:
+            error_msg = f"文本优化失败: {str(e)}"
+            logger.error(error_msg)
+            st.error(f"❌ {error_msg}")
+            
+            # 提供详细的错误信息和解决建议
+            with st.expander("🔍 错误详情"):
+                st.code(str(e))
+                st.write("**可能的解决方案:**")
+                st.write("1. 检查网络连接和API服务状态")
+                st.write("2. 验证API密钥是否有效且有足够配额")
+                st.write("3. 检查配置文件中的翻译设置")
+                st.write("4. 尝试稍后重试，可能是服务临时不可用")
     
     def _show_detailed_report(self, confirmation_segments: List[SegmentDTO]):
         """显示详细的确认报告"""

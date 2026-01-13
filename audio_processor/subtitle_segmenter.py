@@ -58,9 +58,16 @@ class SubtitleSegmenter:
         self.ideal_segment_duration = 12.0  # 理想时长12秒
         self.min_segment_duration = 8.0   # 最短8秒
         self.max_segment_duration = 16.0  # 最长16秒
+        
+        # 动态字符数参数（根据语言调整）
         self.ideal_chars = 120             # 理想字符数（约40个汉字）
         self.min_chars = 80               # 最少字符数（约27个汉字）
         self.max_chars = 160              # 最多字符数（约53个汉字）
+        
+        # 英文优化参数
+        self.english_ideal_chars = 200     # 英文理想字符数（约30-40个单词）
+        self.english_min_chars = 120       # 英文最少字符数（约20个单词）
+        self.english_max_chars = 280       # 英文最多字符数（约50个单词）
     
     def _report_progress(self, current: int, total: int, message: str):
         """报告进度"""
@@ -83,6 +90,13 @@ class SubtitleSegmenter:
         try:
             logger.info(f"开始规则分段处理，原始片段数: {len(segments)}")
             self._report_progress(0, 100, "开始规则分段分析...")
+            
+            # 0. 检测语言并调整参数
+            self._report_progress(5, 100, "检测字幕语言...")
+            detected_language = self._detect_subtitle_language(segments)
+            self.current_language = detected_language  # 保存检测到的语言
+            self._adjust_parameters_for_language(detected_language)
+            logger.info(f"检测到字幕语言: {detected_language}，已调整分段参数")
             
             # 1. 快速质量评估 - 如果原始分段已经很好，直接跳过
             self._report_progress(10, 100, "评估原始分段质量...")
@@ -139,7 +153,7 @@ class SubtitleSegmenter:
             duration = seg['duration']
             
             # 字符数和时长都在合理范围内
-            if (self.min_chars <= char_count <= self.max_chars and 
+            if (self.current_min_chars <= char_count <= self.current_max_chars and 
                 self.min_segment_duration <= duration <= self.max_segment_duration):
                 good_segments += 1
         
@@ -152,6 +166,88 @@ class SubtitleSegmenter:
         
         logger.info(f"原始分段需要优化 (质量比例: {quality_ratio:.1%})")
         return False
+    
+    def _detect_subtitle_language(self, segments: List[Dict[str, Any]]) -> str:
+        """
+        检测字幕语言
+        
+        Args:
+            segments: 字幕片段列表
+            
+        Returns:
+            检测到的语言代码 ('zh', 'en', 'ja', 'ko', 等)
+        """
+        if not segments:
+            return 'zh'  # 默认中文
+        
+        # 取前几个片段的文本进行分析
+        sample_texts = []
+        for i, seg in enumerate(segments[:10]):  # 只分析前10个片段
+            text = seg.get('text', '').strip()
+            if text:
+                sample_texts.append(text)
+        
+        if not sample_texts:
+            return 'zh'
+        
+        combined_text = ' '.join(sample_texts)
+        
+        # 简单的语言检测逻辑
+        # 检测中文字符
+        chinese_chars = sum(1 for char in combined_text if '\u4e00' <= char <= '\u9fff')
+        
+        # 检测英文单词
+        english_words = len([word for word in combined_text.split() if word.isalpha() and all(ord(c) < 128 for c in word)])
+        
+        # 检测日文字符（平假名、片假名）
+        japanese_chars = sum(1 for char in combined_text if '\u3040' <= char <= '\u309f' or '\u30a0' <= char <= '\u30ff')
+        
+        # 检测韩文字符
+        korean_chars = sum(1 for char in combined_text if '\uac00' <= char <= '\ud7af')
+        
+        total_chars = len(combined_text.replace(' ', ''))
+        
+        # 判断主要语言
+        if chinese_chars > total_chars * 0.3:
+            return 'zh'
+        elif english_words > 5 and english_words > chinese_chars:
+            return 'en'
+        elif japanese_chars > total_chars * 0.2:
+            return 'ja'
+        elif korean_chars > total_chars * 0.2:
+            return 'ko'
+        else:
+            # 如果都不明显，通过其他特征判断
+            if '.' in combined_text and combined_text.count('.') > combined_text.count('。'):
+                return 'en'  # 英文标点更多
+            else:
+                return 'zh'  # 默认中文
+    
+    def _adjust_parameters_for_language(self, language: str):
+        """
+        根据检测到的语言调整分段参数
+        
+        Args:
+            language: 语言代码
+        """
+        if language == 'en':
+            # 英文参数
+            self.current_ideal_chars = self.english_ideal_chars
+            self.current_min_chars = self.english_min_chars
+            self.current_max_chars = self.english_max_chars
+            logger.info(f"使用英文分段参数: {self.current_min_chars}-{self.current_max_chars} 字符")
+        elif language in ['ja', 'ko']:
+            # 日韩文参数（介于中英文之间）
+            self.current_ideal_chars = int(self.ideal_chars * 1.3)
+            self.current_min_chars = int(self.min_chars * 1.2)
+            self.current_max_chars = int(self.max_chars * 1.3)
+            logger.info(f"使用日韩文分段参数: {self.current_min_chars}-{self.current_max_chars} 字符")
+        else:
+            # 中文或其他语言使用默认参数
+            self.current_ideal_chars = self.ideal_chars
+            self.current_min_chars = self.min_chars
+            self.current_max_chars = self.max_chars
+            logger.info(f"使用中文分段参数: {self.current_min_chars}-{self.current_max_chars} 字符")
     
     def _rule_based_pre_segmentation(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -178,7 +274,7 @@ class SubtitleSegmenter:
             should_split = False
             
             # 1. 基于字符数 - 超过最大字符数强制分段
-            if len(current_text) > self.max_chars:
+            if len(current_text) > self.current_max_chars:
                 should_split = True
             
             # 2. 基于时长 - 超过最大时长强制分段
@@ -242,7 +338,13 @@ class SubtitleSegmenter:
         if '\n' in current_seg.get('original_raw_text', ''):
             return True
         
-        # 3. 检测话题转换（简单实现）
+        # 3. 英文特有的语义边界检测
+        if hasattr(self, 'current_language') and self.current_language == 'en':
+            # 检测英文句子结构
+            if self._is_english_sentence_boundary(text, all_segments, current_index):
+                return True
+        
+        # 4. 检测话题转换（简单实现）
         if current_index > 0:
             prev_text = all_segments[current_index - 1]['text'].strip()
             
@@ -253,6 +355,45 @@ class SubtitleSegmenter:
                 prev_words = set(prev_text[-20:].split())
                 if len(current_words & prev_words) < 2:  # 几乎没有共同词
                     return True
+        
+        return False
+    
+    def _is_english_sentence_boundary(self, text: str, all_segments: List[Dict], current_index: int) -> bool:
+        """
+        检测英文特有的语义边界
+        
+        Args:
+            text: 当前文本
+            all_segments: 所有片段
+            current_index: 当前索引
+            
+        Returns:
+            是否为英文语义边界
+        """
+        # 1. 检测完整句子结束
+        if text.endswith(('.', '!', '?', '...', '."', '!"', '?"')):
+            return True
+        
+        # 2. 检测对话结束
+        if text.endswith(('."', '!"', '?"', ".'", "!'", "?'")):
+            return True
+        
+        # 3. 检测段落标记词
+        paragraph_markers = ['however', 'meanwhile', 'furthermore', 'moreover', 'therefore', 'consequently', 'nevertheless']
+        words = text.lower().split()
+        if words and words[0] in paragraph_markers:
+            return True
+        
+        # 4. 检测时间或场景转换
+        time_markers = ['later', 'earlier', 'meanwhile', 'suddenly', 'then', 'next', 'finally']
+        if words and words[0] in time_markers:
+            return True
+        
+        # 5. 检测对话开始
+        if text.startswith(('"', "'")) and current_index > 0:
+            prev_text = all_segments[current_index - 1]['text'].strip()
+            if not prev_text.startswith(('"', "'")):
+                return True
         
         return False
     

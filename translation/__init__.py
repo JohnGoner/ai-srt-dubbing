@@ -4,5 +4,7 @@
 """
 
 from .translator import Translator
+from .context_translator import ContextTranslator
+from .translation_factory import TranslationFactory
 
-__all__ = ['Translator'] 
+__all__ = ['Translator', 'ContextTranslator', 'TranslationFactory'] 

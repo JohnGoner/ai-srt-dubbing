@@ -1,9 +1,9 @@
 """
-Azure TTS模块 - 支持循环逼近算法的精确语速控制
-使用Azure Speech Services进行多语言语音合成，支持SSML层面的语速微调
+MiniMax TTS模块 - 支持循环逼近算法的精确语速控制
+使用MiniMax Speech Services进行多语言语音合成，支持语速微调
 """
 
-import azure.cognitiveservices.speech as speechsdk
+import requests
 from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
 import tempfile
@@ -13,14 +13,16 @@ import io
 import time
 import threading
 from datetime import datetime, timedelta
+import base64
+import json
 
 
-class AzureTTS:
-    """Azure TTS语音合成器 - 支持精确语速控制"""
+class MinimaxTTS:
+    """MiniMax TTS语音合成器 - 支持精确语速控制"""
     
     def __init__(self, config: dict):
         """
-        初始化Azure TTS
+        初始化MiniMax TTS
         
         Args:
             config: 配置字典
@@ -28,48 +30,49 @@ class AzureTTS:
         self.config = config
         api_keys = config.get('api_keys', {})
         
-        # 获取两个Azure Speech key用于故障切换
-        self.api_key_1 = api_keys.get('azure_speech_key_1')
-        self.api_key_2 = api_keys.get('azure_speech_key_2')
+        # 获取MiniMax API配置
+        self.api_key = api_keys.get('minimax_api_key')
+        self.group_id = api_keys.get('minimax_group_id')
+        self.base_url = api_keys.get('minimax_base_url', 'https://api.minimax.chat/v1')
         
-        # 向后兼容：如果只有一个key配置
-        if not self.api_key_1 and not self.api_key_2:
-            self.api_key_1 = api_keys.get('azure_speech_key')
+        if not self.api_key:
+            raise ValueError("未配置MiniMax API密钥")
         
-        self.region = api_keys.get('azure_speech_region')
-        self.endpoint = api_keys.get('azure_speech_endpoint')
         self.tts_config = config.get('tts', {})
         
-        # 当前使用的key索引（0表示key_1，1表示key_2）
-        self.current_key_index = 0
-        
-        # 配置语音合成
-        self.speech_config = self._create_speech_config(self.api_key_1)
-        
-        # 设置输出格式 - 使用48kHz获得高保真音质
-        self.speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm
-        )
-        
-        # 语音映射
-        self.voice_map = self.tts_config.get('azure', {}).get('voices', {})
+        # 语音映射 - MiniMax支持的语音ID（统一使用英语表达语音）
+        self.voice_map = self.tts_config.get('minimax', {}).get('voices', {
+            'en': 'English_expressive_narrator',  # 英语表达语音
+            'zh': 'English_expressive_narrator',  # 中文也使用英语语音
+            'ja': 'English_expressive_narrator',  # 日语也使用英语语音
+            'ko': 'English_expressive_narrator',  # 韩语也使用英语语音
+            'es': 'English_expressive_narrator',  # 西班牙语也使用英语语音
+            'fr': 'English_expressive_narrator',  # 法语也使用英语语音
+            'de': 'English_expressive_narrator'   # 德语也使用英语语音
+        })
         
         # 基础语音参数
         self.base_speech_rate = self.tts_config.get('speech_rate', 1.0)
         self.pitch = self.tts_config.get('pitch', 0)
-        self.volume = self.tts_config.get('volume', 90)  # 调整为90%，避免音量过大
+        self.volume = self.tts_config.get('volume', 1.0)
         
-        # 请求频率控制 - 针对并发优化的参数
+        # 停顿时长配置（可在config.yaml中调整）
+        pause_config = self.tts_config.get('minimax', {}).get('pause_settings', {})
+        self.major_pause_duration = pause_config.get('major_pause_duration', 0.35)  # 句号、问号、感叹号停顿（秒）
+        self.minor_pause_duration = pause_config.get('minor_pause_duration', 0.18)  # 逗号、分号、冒号停顿（秒）
+        self.custom_pause_multiplier = pause_config.get('pause_multiplier', 1.0)    # 整体停顿倍率调节
+        
+        # 请求频率控制 - 更保守的设置
         self.request_lock = threading.Lock()
         self.last_request_time = datetime.now()
-        self.min_request_interval = 0.15  # 每个请求之间最小间隔150ms（为并发优化）
+        self.min_request_interval = 0.5  # 每个请求之间最小间隔500ms（更保守）
         self.request_count = 0
         self.rate_limit_reset_time = datetime.now()
-        self.max_requests_per_minute = 120  # 每分钟最大请求数（为并发控制更保守）
+        self.max_requests_per_minute = 40  # 每分钟最大请求数（更保守）
         
-        # 并发控制相关
+        # 并发控制相关 - 降低并发数避免429错误
         self.concurrent_requests = 0  # 当前并发请求数
-        self.max_concurrent_requests = 8  # 最大并发请求数
+        self.max_concurrent_requests = 3  # 最大并发请求数（更保守）
         
         # 错误恢复相关
         self.consecutive_errors = 0
@@ -80,7 +83,7 @@ class AzureTTS:
         # 成本跟踪
         self.api_call_count = 0
         self.total_characters = 0
-        self.cost_per_character = 0.000015  # Azure TTS定价（约$15/1M字符）
+        self.cost_per_character = 0.00002  # MiniMax TTS定价估算
         self.session_start_time = datetime.now()
         
         # 循环逼近相关参数
@@ -90,83 +93,12 @@ class AzureTTS:
             'fr': {'rate_offset': 0.10},    # 法语快一点
             'de': {'rate_offset': 0.05},    # 德语较稳重
             'ja': {'rate_offset': 0.02},    # 日语较慢
-            'ko': {'rate_offset': 0.04}     # 韩语中等调整
+            'ko': {'rate_offset': 0.04},    # 韩语中等调整
+            'zh': {'rate_offset': 0.00}     # 中文标准
         }
 
-        # === 动态校准相关 ===
-        # 记录各语言的估算校准因子（actual / estimated）及样本数量
-        # 通过滑动平均逐步提升估算精度，进而减少TTS调用次数
+        # 动态校准相关
         self._calibration_factors: Dict[str, Dict[str, float]] = {}
-    
-    def _create_speech_config(self, api_key: str) -> speechsdk.SpeechConfig:
-        """
-        创建语音配置对象
-        
-        Args:
-            api_key: Azure Speech API key
-            
-        Returns:
-            SpeechConfig对象
-        """
-        if self.endpoint:
-            # 使用endpoint创建配置
-            config = speechsdk.SpeechConfig(
-                subscription=api_key,
-                endpoint=self.endpoint
-            )
-        else:
-            # 使用region创建配置
-            config = speechsdk.SpeechConfig(
-                subscription=api_key,
-                region=self.region
-            )
-        
-        # 设置超时参数以解决解码器启动超时问题
-        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "15000")  # 15秒初始静音超时
-        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "8000")  # 8秒结束静音超时
-        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "15000")  # 15秒连接超时
-        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "8000")  # 8秒结束超时
-        
-        # 设置更保守的连接参数以减少解码器超时
-        config.set_property(speechsdk.PropertyId.Speech_LogFilename, "")  # 禁用日志文件
-        config.set_property(speechsdk.PropertyId.SpeechServiceConnection_RecoMode, "INTERACTIVE")  # 使用交互模式
-        
-        return config
-    
-    def _switch_to_backup_key(self) -> bool:
-        """
-        切换到备用key
-        
-        Returns:
-            是否成功切换
-        """
-        try:
-            if self.current_key_index == 0 and self.api_key_2:
-                # 切换到第二个key
-                self.current_key_index = 1
-                self.speech_config = self._create_speech_config(self.api_key_2)
-                # 重新设置输出格式
-                self.speech_config.set_speech_synthesis_output_format(
-                    speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm
-                )
-                logger.warning("Azure Speech key 1 失败，已切换到 key 2")
-                return True
-            elif self.current_key_index == 1 and self.api_key_1:
-                # 切换到第一个key
-                self.current_key_index = 0
-                self.speech_config = self._create_speech_config(self.api_key_1)
-                # 重新设置输出格式
-                self.speech_config.set_speech_synthesis_output_format(
-                    speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm
-                )
-                logger.warning("Azure Speech key 2 失败，已切换到 key 1")
-                return True
-            else:
-                logger.error("无法切换到备用key，或备用key不存在")
-                return False
-        except Exception as e:
-            logger.error(f"切换到备用key失败: {str(e)}")
-            return False
     
     def generate_audio_segments(self, segments: List[Dict[str, Any]], target_language: str) -> List[Dict[str, Any]]:
         """
@@ -183,23 +115,23 @@ class AzureTTS:
             logger.info(f"开始并发生成 {len(segments)} 个音频片段")
             
             # 获取对应语言的语音
-            voice_name = self.voice_map.get(target_language)
-            if not voice_name:
+            voice_id = self.voice_map.get(target_language)
+            if not voice_id:
                 raise ValueError(f"不支持的语言: {target_language}")
             
-            return self._generate_audio_segments_concurrent(segments, voice_name)
+            return self._generate_audio_segments_concurrent(segments, voice_id)
             
         except Exception as e:
             logger.error(f"生成音频片段失败: {str(e)}")
             raise
     
-    def _generate_audio_segments_concurrent(self, segments: List[Dict[str, Any]], voice_name: str) -> List[Dict[str, Any]]:
+    def _generate_audio_segments_concurrent(self, segments: List[Dict[str, Any]], voice_id: str) -> List[Dict[str, Any]]:
         """
         并发生成音频片段
         
         Args:
             segments: 片段列表
-            voice_name: 语音名称
+            voice_id: 语音ID
             
         Returns:
             音频片段列表
@@ -207,8 +139,8 @@ class AzureTTS:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         
-        # 控制并发数，考虑API限制
-        max_workers = min(6, len(segments), max(2, len(segments) // 4))
+        # 控制并发数，考虑API限制 - 更保守的设置
+        max_workers = min(self.max_concurrent_requests, len(segments), max(1, len(segments) // 6))
         
         results_lock = threading.Lock()
         completed_count = 0
@@ -221,7 +153,7 @@ class AzureTTS:
                 # 使用默认语速生成
                 audio_data = self._generate_single_audio(
                     segment['translated_text'],
-                    voice_name,
+                    voice_id,
                     self.base_speech_rate,
                     segment.get('duration', 0)
                 )
@@ -279,22 +211,22 @@ class AzureTTS:
         
         return audio_segments
     
-    def _generate_single_audio(self, text: str, voice_name: str, 
+    def _generate_single_audio(self, text: str, voice_id: str, 
                               speech_rate: Optional[float] = None, 
                               target_duration: Optional[float] = None) -> AudioSegment:
         """
-        生成单个音频片段 - 支持精确语速控制和故障切换
+        生成单个音频片段 - 支持精确语速控制
         
         Args:
             text: 文本内容
-            voice_name: 语音名称
-            speech_rate: 语速倍率 (1.0-1.12)
+            voice_id: 语音ID
+            speech_rate: 语速倍率 (0.5-2.0)
             target_duration: 目标时长（用于记录，不影响生成）
             
         Returns:
             音频片段对象
         """
-        max_retries = 3  # 增加重试次数
+        max_retries = 3
         
         for attempt in range(max_retries):
             try:
@@ -307,22 +239,23 @@ class AzureTTS:
                 # 使用传入的语速，或默认语速
                 effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
                 
-                # 构建优化的SSML
-                ssml = self._build_precise_ssml(text, voice_name, effective_rate)
+                # 构建请求payload
+                payload = self._build_payload(text, voice_id, effective_rate)
                 
-                # 创建合成器
-                synthesizer = speechsdk.SpeechSynthesizer(
-                    speech_config=self.speech_config,
-                    audio_config=None
-                )
+                # 发送请求
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
                 
-                # 合成语音
-                result = synthesizer.speak_ssml_async(ssml).get()
+                # 根据官方文档，API端点格式应该是带GroupId参数的
+                if not self.group_id:
+                    raise ValueError("MiniMax API需要group_id参数")
+                url = f"{self.base_url}/t2a_v2?GroupId={self.group_id}"
                 
-                if result is None:
-                    raise Exception("语音合成返回空结果")
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
                 
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                if response.status_code == 200:
                     # 成功，重置错误计数
                     self.consecutive_errors = 0
                     self.last_error_time = None
@@ -330,175 +263,182 @@ class AzureTTS:
                     # 释放并发计数
                     self._release_rate_limit()
                     
-                    # 转换为AudioSegment - Raw PCM格式
-                    # Azure TTS返回的是Raw 48kHz 16-bit mono PCM数据
-                    audio_segment = AudioSegment(
-                        data=result.audio_data,
-                        sample_width=2,  # 16-bit = 2 bytes
-                        frame_rate=48000,
-                        channels=1
-                    )
+                    # 处理响应
+                    try:
+                        result = response.json()
+                        logger.debug(f"MiniMax API响应结构: {list(result.keys())}")
+                        
+                        # 根据官方示例，检查响应格式
+                        # 官方示例直接打印response.text，说明可能有不同的响应格式
+                        
+                        # 尝试多种可能的响应结构
+                        audio_hex = None
+                        
+                        # 方式1: data.audio 结构
+                        if 'data' in result and isinstance(result['data'], dict) and 'audio' in result['data']:
+                            audio_hex = result['data']['audio']
+                            logger.debug("使用data.audio结构解析音频数据")
+                        
+                        # 方式2: 直接audio字段
+                        elif 'audio' in result:
+                            audio_hex = result['audio']
+                            logger.debug("使用直接audio字段解析音频数据")
+                        
+                        # 方式3: base64编码的音频数据
+                        elif 'data' in result and 'audio_data' in result['data']:
+                            audio_hex = result['data']['audio_data']
+                            logger.debug("使用data.audio_data结构解析音频数据")
+                        
+                        # 如果都没找到，记录完整响应结构用于调试
+                        if not audio_hex:
+                            logger.error(f"无法找到音频数据，完整响应结构: {result}")
+                            raise Exception(f"响应中未找到音频数据，响应结构: {list(result.keys())}")
+                        
+                        if not audio_hex:
+                            raise Exception("音频数据为空")
+                        
+                        logger.debug(f"收到音频数据长度: {len(audio_hex)} 字符")
+                        
+                        # 尝试解析音频数据 - 支持十六进制和base64两种格式
+                        audio_data = None
+                        
+                        # 尝试十六进制解码
+                        try:
+                            audio_data = bytes.fromhex(audio_hex)
+                            logger.debug(f"十六进制解码成功，音频数据长度: {len(audio_data)} 字节")
+                        except ValueError:
+                            logger.debug("十六进制解码失败，尝试base64解码")
+                            # 尝试base64解码
+                            try:
+                                audio_data = base64.b64decode(audio_hex)
+                                logger.debug(f"base64解码成功，音频数据长度: {len(audio_data)} 字节")
+                            except Exception as e:
+                                raise Exception(f"音频数据解码失败（尝试了十六进制和base64）: {str(e)}")
+                        
+                        if not audio_data or len(audio_data) == 0:
+                            raise Exception("解码后的音频数据为空")
+                            
+                    except json.JSONDecodeError as e:
+                        raise Exception(f"JSON解析失败: {str(e)}")
+                    except Exception as e:
+                        if "响应中缺少" in str(e) or "JSON解析失败" in str(e):
+                            raise e
+                        else:
+                            raise Exception(f"处理响应数据失败: {str(e)}")
                     
-                    actual_duration = len(audio_segment) / 1000.0
-                    logger.debug(f"音频生成成功 - 语速: {effective_rate:.3f}, 时长: {actual_duration:.2f}s")
+                    # 转换为AudioSegment - 尝试多种音频格式
+                    audio_segment = None
+                    audio_io = io.BytesIO(audio_data)
                     
-                    return audio_segment
+                    # 尝试不同的音频格式
+                    formats_to_try = ['mp3', 'wav', 'raw']
+                    
+                    for fmt in formats_to_try:
+                        try:
+                            audio_io.seek(0)  # 重置流位置
+                            
+                            if fmt == 'mp3':
+                                audio_segment = AudioSegment.from_mp3(audio_io)
+                            elif fmt == 'wav':
+                                audio_segment = AudioSegment.from_wav(audio_io)
+                            elif fmt == 'raw':
+                                # 尝试作为原始PCM数据（32kHz, 16-bit, mono）
+                                audio_segment = AudioSegment(
+                                    data=audio_data,
+                                    sample_width=2,  # 16-bit = 2 bytes
+                                    frame_rate=32000,  # MiniMax默认32kHz
+                                    channels=1
+                                )
+                            
+                            if audio_segment:
+                                actual_duration = len(audio_segment) / 1000.0
+                                logger.debug(f"音频生成成功 ({fmt}格式) - 语速: {effective_rate:.3f}, 时长: {actual_duration:.2f}s")
+                                return audio_segment
+                                
+                        except Exception as e:
+                            logger.debug(f"尝试{fmt}格式失败: {str(e)}")
+                            continue
+                    
+                    # 如果所有格式都失败，抛出异常
+                    logger.error(f"所有音频格式都无法解码，数据长度: {len(audio_data)}")
+                    raise Exception(f"音频格式转换失败: 尝试了{formats_to_try}格式都无法解码")
                     
                 else:
-                    error_details = result.cancellation_details
-                    error_msg = f"语音合成失败: {result.reason}"
-                    if error_details:
-                        error_msg += f" - {error_details.reason}, {error_details.error_details}"
-                    
+                    error_msg = f"MiniMax TTS请求失败: {response.status_code} - {response.text}"
                     logger.error(error_msg)
                     
                     # 处理特定错误类型
-                    if error_details:
-                        error_str = str(error_details.error_details).lower()
-                        
-                        # 429 Too Many Requests 错误
-                        if '429' in error_str or 'too many requests' in error_str:
-                            self._handle_rate_limit_error(attempt, max_retries)
-                            if attempt < max_retries - 1:
-                                continue
-                        
-                        # 认证或配额错误
-                        elif any(keyword in error_str for keyword in ['unauthorized', 'forbidden', 'quota', 'authentication']):
-                            if attempt < max_retries - 1:
-                                logger.info(f"尝试切换到备用key... (第{attempt + 1}次尝试)")
-                                if self._switch_to_backup_key():
-                                    continue
-                        
-                        # 超时错误和解码器启动错误
-                        elif 'timeout' in error_str or 'codec decoding' in error_str:
-                            self._handle_decoder_timeout_error(attempt, max_retries)
-                            if attempt < max_retries - 1:
-                                continue
+                    if response.status_code == 429:
+                        self._handle_rate_limit_error(attempt, max_retries)
+                        if attempt < max_retries - 1:
+                            continue
                     
                     self._record_error()
-                    # 释放并发计数
                     self._release_rate_limit()
                     raise Exception(error_msg)
                     
             except Exception as e:
                 self._record_error()
-                # 释放并发计数
                 self._release_rate_limit()
                 error_msg = f"生成单个音频失败 (第{attempt + 1}次尝试): {str(e)}"
                 logger.error(error_msg)
                 
-                # 处理特定错误类型
-                error_str = str(e).lower()
-                
                 # 处理429错误
+                error_str = str(e).lower()
                 if '429' in error_str or 'too many requests' in error_str:
                     self._handle_rate_limit_error(attempt, max_retries)
                     if attempt < max_retries - 1:
                         continue
                 
-                # 处理认证相关错误
-                elif any(keyword in error_str for keyword in ['unauthorized', 'forbidden', 'quota', 'authentication']):
-                    if attempt < max_retries - 1:
-                        logger.info(f"尝试切换到备用key... (第{attempt + 1}次尝试)")
-                        if self._switch_to_backup_key():
-                            continue
-                
-                # 处理超时错误和解码器启动错误
-                elif 'timeout' in error_str or 'codec decoding' in error_str:
-                    self._handle_decoder_timeout_error(attempt, max_retries)
-                    if attempt < max_retries - 1:
-                        continue
-                
                 # 如果是最后一次尝试，抛出异常
                 if attempt == max_retries - 1:
-                    # 释放并发计数
                     self._release_rate_limit()
                     raise Exception(f"所有重试都失败: {error_msg}")
         
-        # 释放并发计数
         self._release_rate_limit()        
-        raise Exception("所有Azure Speech key都已尝试，音频生成失败")
+        raise Exception("MiniMax TTS音频生成失败")
     
-    def _build_precise_ssml(self, text: str, voice_name: str, speech_rate: float) -> str:
+    def _build_payload(self, text: str, voice_id: str, speech_rate: float) -> dict:
         """
-        构建精确的SSML标记 - 支持细粒度语速控制
+        构建MiniMax TTS请求payload
         
         Args:
             text: 文本内容
-            voice_name: 语音名称
+            voice_id: 语音ID
             speech_rate: 语速倍率
             
         Returns:
-            SSML字符串
+            请求payload字典
         """
-        # 确保语速在合理范围内（0.95-1.15）
-        rate = max(0.95, min(1.15, speech_rate))
+        # 确保语速在合理范围内（0.5-2.0）
+        rate = max(0.5, min(2.0, speech_rate))
         
-        # 转换为SSML rate格式（百分比）
-        if rate == 1.0:
-            rate_percentage = "medium"  # 使用medium作为标准语速
-        elif rate > 1.0:
-            # 快于标准语速，使用+百分比
-            rate_percentage = f"+{int((rate - 1.0) * 100)}%"
-        else:
-            # 慢于标准语速，使用-百分比
-            rate_percentage = f"-{int((1.0 - rate) * 100)}%"
+        payload = {
+            "model": "speech-2.5-hd-preview",
+            "text": text,
+            "timbre_weights": [
+                {
+                    "voice_id": voice_id,
+                    "weight": 100  # 官方示例使用100而不是1
+                }
+            ],
+            "voice_setting": {
+                "voice_id": "",  # 保持空字符串，语音通过timbre_weights指定
+                "speed": rate,
+                "pitch": self.pitch,
+                "vol": self.volume,
+                "latex_read": False
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3"
+            },
+            "language_boost": "auto"
+        }
         
-        # 音调保持默认值，不进行调整
-        pitch_value = "medium"  # 使用默认音调
-        
-        # 构建SSML，使用精确的语音控制
-        ssml = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="{self._get_language_from_voice(voice_name)}">
-    <voice name="{voice_name}">
-        <prosody rate="{rate_percentage}" pitch="{pitch_value}" volume="{self.volume}%">
-            <break time="100ms"/>
-            {self._preprocess_text_for_speech(text)}
-            <break time="50ms"/>
-        </prosody>
-    </voice>
-</speak>"""
-        
-        logger.debug(f"生成SSML - 语速: {rate_percentage}, 音调: {pitch_value}")
-        return ssml
-    
-    def _preprocess_text_for_speech(self, text: str) -> str:
-        """
-        为语音合成预处理文本
-        
-        Args:
-            text: 原始文本
-            
-        Returns:
-            处理后的文本
-        """
-        # 处理常见的发音问题
-        processed_text = text
-        
-        # 添加适当的停顿
-        processed_text = processed_text.replace('.', '.<break time="300ms"/>')
-        processed_text = processed_text.replace(',', ',<break time="150ms"/>')
-        processed_text = processed_text.replace(';', ';<break time="200ms"/>')
-        processed_text = processed_text.replace(':', ':<break time="200ms"/>')
-        
-        # 处理重音和强调
-        # 可以在这里添加更多的文本处理逻辑
-        
-        return processed_text
-    
-    def _get_language_from_voice(self, voice_name: str) -> str:
-        """
-        从语音名称提取语言代码
-        
-        Args:
-            voice_name: 语音名称 (如: en-US-AriaNeural)
-            
-        Returns:
-            语言代码 (如: en-US)
-        """
-        parts = voice_name.split('-')
-        if len(parts) >= 2:
-            return f"{parts[0]}-{parts[1]}"
-        return "en-US"  # 默认
+        logger.debug(f"生成MiniMax payload - 语速: {rate}, 音调: {self.pitch}, 音量: {self.volume}")
+        return payload
     
     def estimate_speech_duration(self, text: str, language: str, speech_rate: float = 1.0) -> float:
         """
@@ -535,7 +475,8 @@ class AzureTTS:
         minor_pause_chars = ',;，；:'
         minor_pause_count = sum(1 for char in text if char in minor_pause_chars)
         
-        pause_time = major_pause_count * 0.3 + minor_pause_count * 0.15
+        pause_time = (major_pause_count * self.major_pause_duration + 
+                      minor_pause_count * self.minor_pause_duration) * self.custom_pause_multiplier
         
         # 应用语速调整
         total_time = (base_time + pause_time) / speech_rate
@@ -548,7 +489,6 @@ class AzureTTS:
     def estimate_audio_duration_optimized(self, text: str, language: str, speech_rate: float = 1.0) -> float:
         """
         优化的语音时长估算 - 基于单词数和语言特性的精确算法
-        用于减少API调用，特别是在循环逼近算法中
         
         Args:
             text: 文本内容
@@ -558,54 +498,53 @@ class AzureTTS:
         Returns:
             估算的时长（秒）
         """
-        # 基于实际Azure TTS的语音特性优化的估算参数（基于单词数）
+        # 基于MiniMax TTS的语音特性优化的估算参数
         language_params = {
             'en': {
-                'words_per_second': 2.4,  # 英语的实际语速（单词/秒）
+                'words_per_second': 2.4,
                 'pause_weight': 1.0,
-                'ssml_overhead': 0.15  # SSML处理开销
+                'overhead': 0.15
             },
-            'es': {
-                'words_per_second': 2.2,
-                'pause_weight': 1.1,
-                'ssml_overhead': 0.16
-            },
-            'fr': {
-                'words_per_second': 2.3,
-                'pause_weight': 1.0,
-                'ssml_overhead': 0.15
-            },
-            'de': {
-                'words_per_second': 2.1,
-                'pause_weight': 1.2,
-                'ssml_overhead': 0.18
+            'zh': {
+                'words_per_second': 2.0,
+                'pause_weight': 0.9,
+                'overhead': 0.13
             },
             'ja': {
                 'words_per_second': 1.8,
                 'pause_weight': 0.9,
-                'ssml_overhead': 0.12
+                'overhead': 0.12
             },
             'ko': {
                 'words_per_second': 1.9,
                 'pause_weight': 0.95,
-                'ssml_overhead': 0.14
+                'overhead': 0.14
             },
-            'zh': {
-                'words_per_second': 1.6,
-                'pause_weight': 0.85,
-                'ssml_overhead': 0.13
+            'es': {
+                'words_per_second': 2.2,
+                'pause_weight': 1.1,
+                'overhead': 0.16
+            },
+            'fr': {
+                'words_per_second': 2.3,
+                'pause_weight': 1.0,
+                'overhead': 0.15
+            },
+            'de': {
+                'words_per_second': 2.1,
+                'pause_weight': 1.2,
+                'overhead': 0.18
             }
         }
         
         # 获取语言参数，默认使用英语
         lang_params = language_params.get(language, language_params['en'])
         
-        # 计算单词数（更准确的时长估算）
+        # 计算单词数
         words = text.split()
         word_count = len(words)
-        char_count = len(text)
         
-        # 计算基础时长（基于单词数）
+        # 计算基础时长
         base_time = word_count / lang_params['words_per_second']
         
         # 计算标点符号造成的停顿时间
@@ -614,31 +553,33 @@ class AzureTTS:
         minor_pauses = text.count(',') + text.count(';') + text.count(':') + \
                       text.count('，') + text.count('；') + text.count('：')
         
-        pause_time = (major_pauses * 0.35 + minor_pauses * 0.18) * lang_params['pause_weight']
+        pause_time = ((major_pauses * self.major_pause_duration + 
+                       minor_pauses * self.minor_pause_duration) * 
+                      self.custom_pause_multiplier * lang_params['pause_weight'])
         
         # 应用语速调整
         adjusted_time = (base_time + pause_time) / speech_rate
         
-        # 添加SSML处理开销
-        total_time = adjusted_time + lang_params['ssml_overhead']
+        # 添加处理开销
+        total_time = adjusted_time + lang_params['overhead']
         
         # 添加起始缓冲时间
         buffer_time = 0.2
         
         estimated_duration = total_time + buffer_time
 
-        # === 应用动态校准因子 ===
+        # 应用动态校准因子
         calibration = self._calibration_factors.get(language, {}).get('factor', 1.0)
         estimated_duration *= calibration
 
-        logger.debug(f"时长估算: 文本={word_count}单词({char_count}字符), 基础={base_time:.2f}s, "
+        logger.debug(f"时长估算: 文本={word_count}单词, 基础={base_time:.2f}s, "
                     f"停顿={pause_time:.2f}s, 语速={speech_rate:.2f}, "
                     f"校准因子={calibration:.3f}, 预估={estimated_duration:.2f}s")
         
         return estimated_duration
     
     def estimate_optimal_speech_rate(self, text: str, language: str, target_duration: float, 
-                                   min_rate: float = 0.95, max_rate: float = 1.15) -> float:
+                                   min_rate: float = 0.5, max_rate: float = 2.0) -> float:
         """
         估算达到目标时长所需的最优语速
         
@@ -689,45 +630,24 @@ class AzureTTS:
             'duration': segment.get('duration', 0)
         }
     
-    def get_current_key_info(self) -> dict:
+    def test_voice_synthesis(self, text: str = "这是一个测试", voice_id: Optional[str] = None) -> bool:
         """
-        获取当前使用的key信息
-        
-        Returns:
-            包含当前key信息的字典
-        """
-        current_key = self.api_key_1 if self.current_key_index == 0 else self.api_key_2
-        return {
-            'current_key_index': self.current_key_index,
-            'current_key': current_key[:8] + '...' if current_key else None,
-            'has_backup_key': bool(self.api_key_2 if self.current_key_index == 0 else self.api_key_1),
-            'region': self.region,
-            'endpoint': self.endpoint
-        }
-    
-    def test_voice_synthesis(self, text: str = "这是一个测试", voice_name: Optional[str] = None) -> bool:
-        """
-        测试语音合成功能，支持故障切换
+        测试语音合成功能
         
         Args:
             text: 测试文本
-            voice_name: 语音名称
+            voice_id: 语音ID
             
         Returns:
             测试是否成功
         """
         try:
-            if not voice_name:
-                voice_name = list(self.voice_map.values())[0]
+            if not voice_id:
+                voice_id = list(self.voice_map.values())[0]
             
-            # 显示当前使用的key信息
-            key_info = self.get_current_key_info()
-            logger.info(f"当前使用key {key_info['current_key_index'] + 1}: {key_info['current_key']}")
+            logger.info(f"开始测试MiniMax TTS - 语音ID: {voice_id}")
             
-            # 使用基础语速进行测试
-            if voice_name is None:
-                voice_name = list(self.voice_map.values())[0]
-            test_audio = self._generate_single_audio(text, voice_name, 1.0)  # type: ignore
+            test_audio = self._generate_single_audio(text, voice_id, 1.0)
             
             logger.info(f"语音合成测试成功 - 时长: {len(test_audio)/1000:.2f}s")
             return True
@@ -762,12 +682,10 @@ class AzureTTS:
         Returns:
             最优语速
         """
-        # 获取语言特定的调整，如果没有则使用默认值
         rate_offset = self.language_specific_adjustments.get(language, {}).get('rate_offset', 0)
-        
         optimal_rate = base_rate + rate_offset
-        # 确保在合理范围内：0.8 - 1.15
-        return max(0.8, min(1.15, optimal_rate))
+        # MiniMax支持更宽的语速范围：0.5 - 2.0
+        return max(0.5, min(2.0, optimal_rate))
     
     def create_synthesis_report(self, segments: List[Dict[str, Any]]) -> str:
         """
@@ -785,7 +703,7 @@ class AzureTTS:
         total_segments = len(segments)
         total_duration = sum(seg.get('actual_duration', seg.get('duration', 0)) for seg in segments)
         
-        # 统计语速分布（优化：一次遍历收集所有需要的数据）
+        # 统计语速分布
         speeds = []
         quality_counts = {'excellent': 0, 'good': 0, 'short_text': 0, 'long_text': 0, 'fallback': 0}
         
@@ -802,15 +720,14 @@ class AzureTTS:
         min_speed = min(speeds)
         max_speed = max(speeds)
         
-        # 语速分布统计（新的范围：0.95-1.15）
+        # 语速分布统计（MiniMax范围：0.5-2.0）
         speed_distribution = {
-            '0.95-1.00': sum(1 for s in speeds if 0.95 <= s < 1.00),
-            '1.00-1.05': sum(1 for s in speeds if 1.00 <= s < 1.05),
-            '1.05-1.10': sum(1 for s in speeds if 1.05 <= s < 1.10),
-            '1.10-1.15': sum(1 for s in speeds if 1.10 <= s <= 1.15)
+            '0.5-1.0': sum(1 for s in speeds if 0.5 <= s < 1.0),
+            '1.0-1.5': sum(1 for s in speeds if 1.0 <= s < 1.5),
+            '1.5-2.0': sum(1 for s in speeds if 1.5 <= s <= 2.0)
         }
         
-        report = f"""Azure TTS语音合成报告
+        report = f"""MiniMax TTS语音合成报告
 ========================
 
 基本信息:
@@ -827,10 +744,9 @@ class AzureTTS:
   - 兜底片段: {quality_counts['fallback']} ({quality_counts['fallback']/total_segments*100:.1f}%)
 
 语速分布:
-  - 0.95-1.00: {speed_distribution['0.95-1.00']} 片段
-  - 1.00-1.05: {speed_distribution['1.00-1.05']} 片段
-  - 1.05-1.10: {speed_distribution['1.05-1.10']} 片段
-  - 1.10-1.15: {speed_distribution['1.10-1.15']} 片段
+  - 0.5-1.0: {speed_distribution['0.5-1.0']} 片段
+  - 1.0-1.5: {speed_distribution['1.0-1.5']} 片段
+  - 1.5-2.0: {speed_distribution['1.5-2.0']} 片段
 """
         
         return report
@@ -872,7 +788,7 @@ class AzureTTS:
         summary = self.get_cost_summary()
         
         print("\n" + "="*60)
-        print("🔥 AZURE TTS 成本报告")
+        print("🔥 MINIMAX TTS 成本报告")
         print("="*60)
         print(f"📊 API调用次数: {summary['api_calls']}")
         print(f"📝 总字符数: {summary['total_characters']:,}")
@@ -881,13 +797,6 @@ class AzureTTS:
         print(f"📈 平均调用频率: {summary['avg_calls_per_minute']:.1f}次/分钟")
         print(f"📋 平均字符数/调用: {summary['avg_characters_per_call']:.1f}")
         print("="*60)
-        
-        # 成本优化建议
-        if summary['api_calls'] > 50:
-            print("💡 成本优化建议:")
-            print("  • 启用成本优化模式可减少60-80%的API调用")
-            print("  • 使用估算方法预筛选可避免不必要的API调用")
-            print("  • 考虑批量处理较短的文本片段")
         print("="*60 + "\n")
 
     def _wait_for_rate_limit(self):
@@ -900,7 +809,7 @@ class AzureTTS:
             # 检查并发数限制
             while self.concurrent_requests >= self.max_concurrent_requests:
                 logger.debug(f"达到最大并发数({self.max_concurrent_requests})，等待...")
-                time.sleep(0.05)  # 短暂等待
+                time.sleep(0.1)
                 current_time = datetime.now()
             
             # 重置分钟计数器
@@ -917,7 +826,7 @@ class AzureTTS:
                     self.request_count = 0
                     self.rate_limit_reset_time = datetime.now()
             
-            # 检查请求间隔（对并发请求稍微放宽）
+            # 检查请求间隔
             time_since_last = (current_time - self.last_request_time).total_seconds()
             min_interval = self.min_request_interval / max(1, self.concurrent_requests)
             if time_since_last < min_interval:
@@ -964,43 +873,6 @@ class AzureTTS:
         
         logger.warning(f"遇到429错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
         time.sleep(wait_time)
-    
-    def _handle_timeout_error(self, attempt: int, max_retries: int):
-        """
-        处理超时错误
-        """
-        wait_time = 1.0 + (attempt * 0.5)  # 渐进式等待
-        logger.warning(f"遇到超时错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
-        time.sleep(wait_time)
-    
-    def _handle_decoder_timeout_error(self, attempt: int, max_retries: int):
-        """
-        处理解码器启动超时错误 - 增强版本
-        """
-        # 对于解码器启动超时，使用更长的等待时间和更保守的策略
-        if attempt == 0:
-            # 第一次遇到解码器超时，等待较长时间
-            base_wait = 5.0
-        elif attempt == 1:
-            # 第二次，等待更长时间
-            base_wait = 8.0
-        else:
-            # 后续尝试，使用指数退避
-            base_wait = 10.0 + (attempt * 2.0)
-        
-        jitter = 0.3 * base_wait  # 30%的随机延迟
-        wait_time = base_wait + jitter
-        
-        logger.warning(f"遇到解码器启动超时错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
-        
-        # 在等待期间，尝试清理可能的资源
-        try:
-            import gc
-            gc.collect()  # 强制垃圾回收
-        except:
-            pass
-        
-        time.sleep(wait_time) 
 
     def update_calibration(self, language: str, estimated_duration: float, actual_duration: float):
         """根据一次真实合成结果更新指定语言的校准因子
@@ -1032,7 +904,7 @@ class AzureTTS:
 
     def get_calibration_factor(self, language: str) -> float:
         """获取指定语言的当前校准因子"""
-        return self._calibration_factors.get(language, {}).get('factor', 1.0) 
+        return self._calibration_factors.get(language, {}).get('factor', 1.0)
 
     def synthesize_speech_optimized(self, text: str, language: str, speech_rate: float, file_prefix: str = "tts_segment") -> str:
         """
@@ -1045,14 +917,14 @@ class AzureTTS:
         Returns:
             生成的音频文件路径
         """
-        voice_name = self.voice_map.get(language)
-        if not voice_name:
+        voice_id = self.voice_map.get(language)
+        if not voice_id:
             raise ValueError(f"未配置语言 {language} 的voice")
-        audio_segment = self._generate_single_audio(text, voice_name, speech_rate)
+        audio_segment = self._generate_single_audio(text, voice_id, speech_rate)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", prefix=file_prefix + "_") as f:
             audio_segment.export(f.name, format="wav")
             file_path = f.name
-        return file_path 
+        return file_path
 
     def get_audio_duration(self, audio_file_path: str) -> float:
         """
@@ -1071,4 +943,83 @@ class AzureTTS:
             return duration_seconds
         except Exception as e:
             logger.error(f"获取音频时长失败: {e}")
-            return 0.0 
+            return 0.0
+
+    def test_pause_duration_settings(self, test_texts: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        测试停顿时长设置的效果
+        
+        Args:
+            test_texts: 测试文本列表，如果不提供则使用默认测试文本
+            
+        Returns:
+            测试结果字典
+        """
+        if test_texts is None:
+            test_texts = [
+                "这是一个测试。包含句号的停顿。",
+                "测试逗号，分号；还有冒号：的停顿效果。",
+                "问号停顿测试？感叹号停顿测试！",
+                "综合测试：句号。逗号，问号？感叹号！分号；冒号：的停顿。"
+            ]
+        
+        results = {
+            'pause_config': {
+                'major_pause_duration': self.major_pause_duration,
+                'minor_pause_duration': self.minor_pause_duration,
+                'pause_multiplier': self.custom_pause_multiplier
+            },
+            'test_results': []
+        }
+        
+        logger.info(f"开始测试停顿时长设置 - 句号停顿: {self.major_pause_duration}s, 逗号停顿: {self.minor_pause_duration}s, 倍率: {self.custom_pause_multiplier}")
+        
+        for i, text in enumerate(test_texts):
+            try:
+                # 统计标点符号数量
+                major_count = sum(1 for char in text if char in '.!?。！？')
+                minor_count = sum(1 for char in text if char in ',;，；:')
+                
+                # 估算时长
+                estimated_duration = self.estimate_audio_duration_optimized(text, 'zh', 1.0)
+                
+                # 计算预期停顿时间
+                expected_pause_time = ((major_count * self.major_pause_duration + 
+                                      minor_count * self.minor_pause_duration) * 
+                                     self.custom_pause_multiplier)
+                
+                test_result = {
+                    'text': text,
+                    'text_length': len(text),
+                    'major_pauses': major_count,
+                    'minor_pauses': minor_count,
+                    'expected_pause_time': expected_pause_time,
+                    'estimated_total_duration': estimated_duration,
+                    'pause_ratio': expected_pause_time / estimated_duration if estimated_duration > 0 else 0
+                }
+                
+                results['test_results'].append(test_result)
+                
+                logger.info(f"测试文本{i+1}: {text[:20]}... - 预期停顿: {expected_pause_time:.2f}s, 总时长: {estimated_duration:.2f}s")
+                
+            except Exception as e:
+                logger.error(f"测试文本{i+1}失败: {str(e)}")
+                results['test_results'].append({
+                    'text': text,
+                    'error': str(e)
+                })
+        
+        # 计算平均停顿比例
+        successful_tests = [r for r in results['test_results'] if 'error' not in r]
+        if successful_tests:
+            avg_pause_ratio = sum(r['pause_ratio'] for r in successful_tests) / len(successful_tests)
+            results['summary'] = {
+                'total_tests': len(test_texts),
+                'successful_tests': len(successful_tests),
+                'average_pause_ratio': avg_pause_ratio,
+                'pause_impact': '高' if avg_pause_ratio > 0.3 else '中' if avg_pause_ratio > 0.15 else '低'
+            }
+            
+            logger.info(f"停顿测试完成 - 平均停顿占比: {avg_pause_ratio:.1%}, 停顿影响: {results['summary']['pause_impact']}")
+        
+        return results

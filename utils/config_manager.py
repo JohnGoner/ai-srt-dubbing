@@ -147,14 +147,11 @@ class ConfigManager:
             "path": str(config_file.resolve()),
             "size": f"{config_file.stat().st_size} bytes",
             "modified": config_file.stat().st_mtime,
-            "translation_model": self.config.get('translation', {}).get('model', 'N/A'),
-            "supported_languages": list(self.config.get('tts', {}).get('azure', {}).get('voices', {}).keys()),
+            "translation_service": self.config.get('translation', {}).get('service', 'N/A'),
+            "supported_languages": list(self.config.get('tts', {}).get('minimax', {}).get('voices', {}).keys()),
             "speech_rate": self.config.get('tts', {}).get('speech_rate', 1.0),
             "volume": self.config.get('tts', {}).get('volume', 90),
-            "has_openai_key": bool(self.config.get('api_keys', {}).get('openai_api_key')),
-            "has_azure_key": bool(self.config.get('api_keys', {}).get('azure_speech_key_1') or 
-                                 self.config.get('api_keys', {}).get('azure_speech_key_2')),
-            "azure_region": self.config.get('api_keys', {}).get('azure_speech_region', 'N/A')
+            "has_google_credentials": bool(self.config.get('api_keys', {}).get('google_credentials_path')),
         }
     
     def get_search_paths(self) -> List[str]:
@@ -211,22 +208,21 @@ class ConfigManager:
         
         # 检查API密钥
         api_keys = config.get('api_keys', {})
-        if not api_keys.get('openai_api_key'):
-            warnings.append("OpenAI API密钥未配置")
+        translation_config = config.get('translation', {})
+        translation_service = translation_config.get('service', 'google')
         
-        azure_key_1 = api_keys.get('azure_speech_key_1')
-        azure_key_2 = api_keys.get('azure_speech_key_2')
-        legacy_key = api_keys.get('azure_speech_key')
+        # 检查翻译服务密钥
+        if translation_service == 'google':
+            if not api_keys.get('google_credentials_path'):
+                warnings.append("Google Cloud Translation认证文件路径未配置")
         
-        if not (azure_key_1 or azure_key_2 or legacy_key):
-            warnings.append("Azure Speech API密钥未配置")
-        
-        if not api_keys.get('azure_speech_region'):
-            warnings.append("Azure Speech区域未配置")
+        # 检查MiniMax TTS密钥
+        if not api_keys.get('minimax_api_key'):
+            warnings.append("MiniMax TTS API密钥未配置")
         
         # 检查TTS配置
         tts_config = config.get('tts', {})
-        if not tts_config.get('azure', {}).get('voices'):
+        if not tts_config.get('minimax', {}).get('voices'):
             errors.append("TTS语音配置缺失")
         
         # 如果有警告，将其添加到错误列表（但不影响有效性）
@@ -290,31 +286,32 @@ class ConfigManager:
         return {
             "api_keys": {
                 "openai_api_key": "",
-                "azure_speech_key_1": "",
-                "azure_speech_key_2": "",
-                "azure_speech_region": "eastus",
-                "azure_speech_endpoint": "https://eastus.api.cognitive.microsoft.com/"
+                "google_credentials_path": "",
+                "minimax_api_key": "",
+                "minimax_group_id": "",
             },
             "translation": {
-                "model": "gpt-4o",
-                "max_tokens": 4000,
-                "temperature": 0.3,
-                "system_prompt": "你是一个短视频配音翻译师，擅长将内容转化为日常口语化的表达。请将中文文本翻译成指定的目标语言，需要考虑以下要求：\n1. 使用最日常、最口语化的表达方式，就像朋友间聊天一样\n2. 避免书面语和学术词汇，多用简单直白的词汇\n3. 语调轻松活泼，适合短视频观众的接受习惯\n4. 让观众一听就懂，语气自然亲切有感染力"
+                "service": "google",
+                "context_window_size": 5,
+                "batch_size": 10,
+                "max_concurrent_requests": 5,
+                "use_context": True
             },
             "tts": {
-                "azure": {
+                "service": "minimax",
+                "minimax": {
                     "voices": {
-                        "en": "en-US-AndrewMultilingualNeural",
-                        "es": "es-MX-JorgeNeural",
-                        "fr": "fr-FR-DeniseNeural",
-                        "de": "de-DE-KatjaNeural",
-                        "ja": "ja-JP-NanamiNeural",
-                        "ko": "ko-KR-SunHiNeural"
+                        "en": "English_ReservedYoungMan",
+                        "es": "Spanish_MaturePartner",
+                        "fr": "French_FriendlyWoman",
+                        "de": "German_FriendlyWoman",
+                        "ja": "Japanese_FriendlyWoman",
+                        "ko": "Korean_FriendlyWoman"
                     }
                 },
                 "speech_rate": 1.0,
                 "pitch": 0,
-                "volume": 90
+                "volume": 1.0
             },
             "timing": {
                 "max_speed_ratio": 1.15,

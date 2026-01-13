@@ -2,6 +2,20 @@
 config.yaml
 *.key
 *.secret
+.env
+.env.*
+
+# Firebase/Google 认证相关
+google-credentials.json
+firebase-credentials.json
+*firebase*admin*.json
+ai-dubbing-system-*.json
+FIREBASE_SETUP.md
+README_AUTH_UPGRADE.md
+
+# Cloudflare Tunnel 配置
+cloudflared-config.yml
+cloudflared.exe
 
 # 输出文件
 output/

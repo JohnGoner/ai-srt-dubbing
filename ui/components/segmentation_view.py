@@ -21,7 +21,7 @@ class SegmentationView:
                             segmented_segments: List[SegmentDTO], 
         config: Dict[str, Any]) -> Dict[str, Any]:
         """
-        渲染分段确认界面
+        渲染分段确认界面 (极简设计)
         
         Args:
             segments: 原始片段列表
@@ -31,8 +31,7 @@ class SegmentationView:
         Returns:
             包含action和数据的结果字典
         """
-        st.markdown("## 🧠 Step 2: 分段结果确认")
-        st.info("💡 **重要说明**: 拆分和合并操作基于原始SRT片段边界，确保时间码的准确性。只有包含多个原始片段的段落才能拆分。")
+        st.markdown('<div class="main-header"><h1>分段确认</h1></div>', unsafe_allow_html=True)
         
         # 使用session_state管理编辑状态，避免状态丢失
         if 'segmentation_edited_segments' not in st.session_state:
@@ -62,18 +61,14 @@ class SegmentationView:
         total_segments = len(self.edited_segments)
         total_pages = (total_segments + segments_per_page - 1) // segments_per_page
         
-        
-        # 自动开启编辑模式
-        edit_mode = True
-        
+        # 统计概览 (极简版)
+        avg_duration = sum(seg.target_duration for seg in self.edited_segments) / len(self.edited_segments)
+        st.caption(f"总段落: {total_segments} | 平均时长: {avg_duration:.1f}秒 | 页面: {self.current_page}/{total_pages}")
         
         st.markdown("---")
         
         # 显示当前页的分段
-        self._render_segments_page(segments_per_page, edit_mode)
-        
-        # 编辑工具栏
-        # self._render_edit_toolbar(segmented_segments)
+        self._render_segments_page(segments_per_page, True)
         
         # 分页控制
         col1, col2 = st.columns(2)
@@ -88,40 +83,6 @@ class SegmentationView:
                 st.session_state.segmentation_current_page = self.current_page
                 st.rerun()
 
-
-        # 统计信息
-        current_segments = self.edited_segments
-        avg_duration = sum(seg.target_duration for seg in current_segments) / len(current_segments)
-        
-        # 简洁的统计卡片，左右居中显示
-        col1, col2, col3 = st.columns([1, 1, 1], gap="large")
-        with col1:
-            st.markdown(
-                f"""
-                <div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>
-                    <div style='font-size: 18px;'>📄 总段落数</div>
-                    <div style='font-size: 28px; font-weight: bold;'>{len(current_segments)}</div>
-                </div>
-                """, unsafe_allow_html=True
-            )
-        with col2:
-            st.markdown(
-                f"""
-                <div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>
-                    <div style='font-size: 18px;'>⏱️ 平均时长</div>
-                    <div style='font-size: 28px; font-weight: bold;'>{avg_duration:.1f}秒</div>
-                </div>
-                """, unsafe_allow_html=True
-            )
-        with col3:
-            st.markdown(
-                f"""
-                <div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>
-                    <div style='font-size: 18px;'>📊 当前页</div>
-                    <div style='font-size: 28px; font-weight: bold;'>{self.current_page}/{total_pages}</div>
-                </div>
-                """, unsafe_allow_html=True
-            )
         # 确认按钮区域
         return self._render_action_buttons(segments)
     

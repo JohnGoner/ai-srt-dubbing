@@ -12,7 +12,7 @@ class CompletionView:
     
     def render(self, completion_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        渲染完成界面
+        渲染完成界面 (极简设计)
         
         Args:
             completion_data: 完成数据
@@ -20,43 +20,41 @@ class CompletionView:
         Returns:
             包含action和数据的结果字典
         """
-        # 🎉 成功消息
-        st.balloons()
-        st.markdown("## 🎉 配音生成成功！")
+        # 成功提示
+        st.success("🎉 配音项目已完成！")
+        st.markdown('<div class="main-header"><h1>处理完成</h1></div>', unsafe_allow_html=True)
         
-        # 下载区域
-        st.markdown("### 📥 下载文件")
-        col1, col2 = st.columns(2)
-        
+        # 下载和试听区域 (极简布局)
+        col1, col2 = st.columns([1, 1])
         with col1:
+            st.markdown("#### 🎧 在线试听")
+            st.audio(completion_data['audio_data'], format='audio/wav')
+        
+        with col2:
+            st.markdown("#### 📥 下载文件")
             st.download_button(
-                label="🎵 下载配音音频",
+                label="下载配音音频 (.wav)",
                 data=completion_data['audio_data'],
                 file_name=f"dubbed_audio_{completion_data['target_lang']}.wav",
                 mime="audio/wav",
-                use_container_width=True,
-                help="下载生成的配音音频文件"
+                use_container_width=True
             )
-        
-        with col2:
             st.download_button(
-                label="📄 下载翻译字幕",
+                label="下载翻译字幕 (.srt)",
                 data=completion_data['subtitle_data'],
                 file_name=f"translated_subtitle_{completion_data['target_lang']}.srt",
                 mime="text/plain",
-                use_container_width=True,
-                help="下载翻译后的字幕文件"
+                use_container_width=True
             )
         
-        # 音频播放器
-        st.markdown("### 🎵 在线试听")
-        st.audio(completion_data['audio_data'], format='audio/wav')
+        st.markdown("---")
         
-        # 统计信息 - 从实际数据计算
-        self._show_enhanced_statistics(completion_data)
-        
-        # 成本报告
-        self._show_cost_report(completion_data)
+        # 统计和成本 (合并显示)
+        col1, col2 = st.columns(2)
+        with col1:
+            self._show_enhanced_statistics(completion_data)
+        with col2:
+            self._show_cost_report(completion_data)
         
         # 操作按钮
         return self._render_action_buttons()
@@ -263,16 +261,22 @@ class CompletionView:
                     translation_duration = translation_stats.get('session_duration_minutes', 0) * 60 if translation_stats else 0
                     session_duration = max(tts_duration, translation_duration)
                     st.metric("会话总时长", f"{session_duration:.1f}s", help="从开始到结束的总处理时间")
+                    
+                    # 计算总成本
+                    tts_cost = tts_stats.get('estimated_cost_usd', 0) if tts_stats else 0
+                    translation_cost = translation_stats.get('estimated_cost_usd', 0) if translation_stats else 0
+                    total_cost = tts_cost + translation_cost
+                    st.metric("总估计成本", f"${total_cost:.4f}", help="TTS + 翻译API的总成本")
                 
                 with col3:
-                    st.metric("TTS调用", f"{tts_calls:,}", help="Azure TTS API调用次数")
+                    st.metric("TTS调用", f"{tts_calls:,}", help="TTS API调用次数")
                 
                 with col4:
                     st.metric("翻译调用", f"{translation_requests:,}", help="翻译API调用次数")
                 
                 # TTS详细统计
                 if tts_stats and tts_calls > 0:
-                    st.markdown("##### 🎵 Azure TTS 统计")
+                    st.markdown("##### 🎵 TTS 统计")
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
@@ -306,9 +310,14 @@ class CompletionView:
                         total_tokens = translation_stats.get('total_tokens', 0)
                         prompt_tokens = translation_stats.get('total_prompt_tokens', 0)
                         completion_tokens = translation_stats.get('total_completion_tokens', 0)
+                        total_chars = translation_stats.get('total_characters', 0)
+                        estimated_cost = translation_stats.get('estimated_cost_usd', 0)
+                        
                         st.metric("总Token数", f"{total_tokens:,}")
                         st.write(f"- 输入Token: {prompt_tokens:,}")
                         st.write(f"- 输出Token: {completion_tokens:,}")
+                        st.metric("翻译字符数", f"{total_chars:,}")
+                        st.metric("翻译估计成本", f"${estimated_cost:.4f}")
                     
                     with col2:
                         avg_tokens = translation_stats.get('avg_tokens_per_request', 0)
@@ -348,10 +357,52 @@ class CompletionView:
                                 color = "red" if rpm_usage > 80 else "orange" if rpm_usage > 60 else "green"
                                 st.markdown(f"**RPM使用率:** <span style='color:{color}'>{rpm_usage:.1f}%</span>", unsafe_allow_html=True)
                                 st.write(f"剩余RPM: {rpm_remaining}")
+                
+                # 综合成本效率分析
+                tts_cost = tts_stats.get('estimated_cost_usd', 0) if tts_stats else 0
+                translation_cost = translation_stats.get('estimated_cost_usd', 0) if translation_stats else 0
+                total_cost = tts_cost + translation_cost
+                
+                if total_cost > 0:
+                    st.markdown("##### 📈 成本效率分析")
+                    
+                    # 计算成本效率指标
+                    segments_count = len(completion_data.get('optimized_segments', []))
+                    cost_per_minute = total_cost / max(1, session_duration / 60) if session_duration > 0 else 0
+                    cost_per_segment = total_cost / max(1, segments_count) if segments_count > 0 else 0
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("总成本/分钟", f"${cost_per_minute:.6f}")
+                        if tts_cost > 0:
+                            st.write(f"- TTS: ${(tts_cost / max(1, session_duration / 60)):.6f}/min")
+                        if translation_cost > 0:
+                            st.write(f"- 翻译: ${(translation_cost / max(1, session_duration / 60)):.6f}/min")
+                    
+                    with col2:
+                        st.metric("总成本/片段", f"${cost_per_segment:.6f}")
+                        if tts_cost > 0:
+                            st.write(f"- TTS: ${(tts_cost / max(1, segments_count)):.6f}/片段")
+                        if translation_cost > 0:
+                            st.write(f"- 翻译: ${(translation_cost / max(1, segments_count)):.6f}/片段")
+                    
+                    with col3:
+                        # 计算性价比（每美元处理的秒数）
+                        total_duration = completion_data.get('stats', {}).get('total_duration', 0)
+                        if total_duration > 0:
+                            value_ratio = total_duration / total_cost
+                            st.metric("性价比", f"{value_ratio:.0f}秒/$")
+                        
+                        # 成本分布
+                        if tts_cost > 0 and translation_cost > 0:
+                            tts_percent = (tts_cost / total_cost) * 100
+                            st.write(f"📊 成本分布:")
+                            st.write(f"- TTS: {tts_percent:.1f}%")
+                            st.write(f"- 翻译: {(100-tts_percent):.1f}%")
         
         elif cost_summary and any(cost_summary.values()):
             # 向后兼容：显示旧版本的TTS成本报告
-            with st.expander("💰 Azure TTS 成本报告", expanded=False):
+            with st.expander("💰 TTS 成本报告", expanded=False):
                 st.markdown("#### 💰 API调用成本分析")
                 
                 # 核心成本指标
@@ -364,12 +415,12 @@ class CompletionView:
                     st.metric(
                         "API调用次数",
                         f"{api_calls:,}",
-                        help="总共调用Azure TTS API的次数"
+                        help="总共调用TTS API的次数"
                     )
                     st.metric(
                         "总字符数",
                         f"{total_chars:,}",
-                        help="发送到Azure TTS的总字符数"
+                        help="发送到TTS的总字符数"
                     )
                 
                 with col2:
