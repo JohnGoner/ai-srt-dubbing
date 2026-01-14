@@ -32,17 +32,21 @@ class CompletionView:
         
         with col2:
             st.markdown("#### 📥 下载文件")
+            # 使用工程名作为下载文件名
+            project_name = completion_data.get('project_name', f"dubbed_audio_{completion_data['target_lang']}")
+            target_lang = completion_data['target_lang']
+            
             st.download_button(
                 label="下载配音音频 (.wav)",
                 data=completion_data['audio_data'],
-                file_name=f"dubbed_audio_{completion_data['target_lang']}.wav",
+                file_name=f"{project_name}_{target_lang}.wav",
                 mime="audio/wav",
                 use_container_width=True
             )
             st.download_button(
                 label="下载翻译字幕 (.srt)",
                 data=completion_data['subtitle_data'],
-                file_name=f"translated_subtitle_{completion_data['target_lang']}.srt",
+                file_name=f"{project_name}_{target_lang}.srt",
                 mime="text/plain",
                 use_container_width=True
             )

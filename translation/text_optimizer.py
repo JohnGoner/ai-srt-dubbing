@@ -72,7 +72,8 @@ class TextOptimizer:
         target_duration: float,
         actual_duration: float,
         target_language: str,
-        original_language: str = 'zh'
+        original_language: str = 'zh',
+        force: bool = False
     ) -> Optional[str]:
         """
         基于时长差距优化文本 - 使用渐进式最小修改策略
@@ -84,6 +85,7 @@ class TextOptimizer:
             actual_duration: 实际音频时长（秒）
             target_language: 目标语言代码
             original_language: 原始语言代码
+            force: 是否强制优化（忽略阈值检查）
             
         Returns:
             优化后的文本，如果失败返回None
@@ -93,8 +95,8 @@ class TextOptimizer:
             duration_diff = actual_duration - target_duration
             duration_diff_ms = duration_diff * 1000
             
-            # 如果差距很小（<100ms），不需要优化
-            if abs(duration_diff_ms) < 100:
+            # 如果差距很小（<50ms）且非强制模式，不需要优化
+            if abs(duration_diff_ms) < 50 and not force:
                 logger.info(f"时长差距很小({duration_diff_ms:.0f}ms)，无需优化")
                 return current_text
             
@@ -153,39 +155,50 @@ class TextOptimizer:
         Returns:
             优化后的文本
         """
-        # 根据时长差距估算需要的词数调整
-        estimated_words = self._estimate_words_for_duration(abs(duration_diff_ms), target_language)
+        # 计算当前文本词数
+        current_word_count = len(current_text.split())
         
-        # 确定尝试的词数范围（从估算值开始，允许±1的浮动）
-        min_words = max(1, estimated_words - 1)
-        max_words = min(5, estimated_words + 1)  # 最多5个词
+        # 根据时长差距估算需要调整的比例和词数
+        adjustment_percentage, estimated_words = self._estimate_adjustment_ratio(
+            abs(duration_diff_ms), 
+            current_text, 
+            target_language
+        )
+        
+        # 传给LLM的比例打4折，避免过度修改
+        llm_percentage = adjustment_percentage * 0.4
+        llm_estimated_words = max(1, int(current_word_count * llm_percentage / 100 + 0.5))
         
         logger.info(f"渐进式优化: 需要{action}{abs(duration_diff_ms):.0f}ms, "
-                   f"估算需要{adjustment_type}{estimated_words}个词")
+                   f"当前{current_word_count}词, 实际需调整{adjustment_percentage:.0f}%({estimated_words}词), 给LLM{llm_percentage:.0f}%（{llm_estimated_words}词）")
         
-        # 使用精确词数控制的prompt
-        optimized_text = self._call_llm_with_precise_control(
+        # 使用比例控制的prompt（传入打折后的比例给LLM，原始比例用于验证）
+        optimized_text = self._call_llm_with_ratio_control(
             original_text,
             current_text,
             target_language,
-            action,
+            action, 
             adjustment_type,
-            estimated_words,
-            duration_diff_ms
+            llm_percentage,
+            llm_estimated_words,
+            duration_diff_ms,
+            actual_percentage=adjustment_percentage,       # 原始比例用于验证
+            actual_estimated_words=estimated_words         # 原始词数用于验证
         )
         
         return optimized_text
     
-    def _estimate_words_for_duration(self, duration_ms: float, target_language: str) -> int:
+    def _estimate_adjustment_ratio(self, duration_diff_ms: float, current_text: str, target_language: str) -> tuple:
         """
-        根据时长差距估算需要调整的词数
+        根据时长差距估算需要调整的比例和词数
         
         Args:
-            duration_ms: 时长差距(ms)
+            duration_diff_ms: 时长差距(ms)
+            current_text: 当前文本
             target_language: 目标语言
             
         Returns:
-            估算的词数
+            (调整比例%, 估算词数)
         """
         # 每个词大约的朗读时长(ms)
         ms_per_word = {
@@ -198,24 +211,40 @@ class TextOptimizer:
         }
         
         avg_ms = ms_per_word.get(target_language, 360)
+        current_word_count = len(current_text.split())
         
-        # 估算词数，向上取整确保足够
-        words = max(1, int(duration_ms / avg_ms + 0.5))
+        # 估算当前文本总时长
+        estimated_current_duration = current_word_count * avg_ms
         
-        return min(words, 5)  # 限制最大5个词
+        # 计算需要调整的比例（基于时长）
+        if estimated_current_duration > 0:
+            adjustment_percentage = (duration_diff_ms / estimated_current_duration) * 100
+        else:
+            adjustment_percentage = 20  # 默认20%
+        
+        # 限制调整比例范围：5% ~ 50%
+        adjustment_percentage = max(5, min(50, abs(adjustment_percentage)))
+        
+        # 根据比例计算词数
+        estimated_words = max(1, int(current_word_count * adjustment_percentage / 100 + 0.5))
+        
+        return adjustment_percentage, estimated_words
     
-    def _call_llm_with_precise_control(
+    def _call_llm_with_ratio_control(
         self,
         original_text: str,
         current_text: str,
         target_language: str,
         action: str,
         adjustment_type: str,
-        word_count: int,
-        duration_diff_ms: float
+        llm_percentage: float,
+        llm_estimated_words: int,
+        duration_diff_ms: float,
+        actual_percentage: float = None,
+        actual_estimated_words: int = None
     ) -> Optional[str]:
         """
-        使用精确词数控制的LLM调用
+        使用比例控制的LLM调用
         
         Args:
             original_text: 原始文本
@@ -223,50 +252,41 @@ class TextOptimizer:
             target_language: 目标语言
             action: 动作
             adjustment_type: 调整类型
-            word_count: 需要调整的词数
+            llm_percentage: 告诉LLM的调整比例(%)（打折后）
+            llm_estimated_words: 告诉LLM的估算词数（打折后）
             duration_diff_ms: 时长差距
+            actual_percentage: 实际需要的调整比例(%)（用于验证）
+            actual_estimated_words: 实际需要的词数（用于验证）
             
         Returns:
             优化后的文本
         """
+        # 如果没传验证参数，使用LLM参数
+        if actual_percentage is None:
+            actual_percentage = llm_percentage
+        if actual_estimated_words is None:
+            actual_estimated_words = llm_estimated_words
         language_name = self.language_names.get(target_language, target_language.upper())
+        current_word_count = len(current_text.split())
         
         # 构建精确控制的system prompt
-        system_prompt = f"""你是一个精确的{language_name}文本微调专家。你的任务是对翻译文本进行【最小限度】的修改。
+        system_prompt = f"""你是一个精确的{language_name}文本微调专家。只做必要的修改，保持原文的语气、风格和核心意思不变，优先删除/添加不影响意思的词（如副词、语气词、修饰词），输出必须是纯{language_name}文本，不包含任何解释"""
 
-核心原则：
-1. 只做必要的修改，不改动不需要改的部分
-2. 保持原文的语气、风格和核心意思完全不变
-3. 优先删除/添加不影响意思的词（如副词、语气词、修饰词）
-4. 输出必须是纯{language_name}文本，不包含任何解释"""
-
-        # 根据需要缩短还是延长，使用不同的策略
+        # 根据需要缩短还是延长，使用不同的策略（使用打折后的比例告诉LLM）
         if action == "缩短":
-            user_prompt = f"""请精确地缩短以下{language_name}文本，只删除{word_count}个词左右。
+            target_word_count = max(1, current_word_count - llm_estimated_words)
+            user_prompt = f"""请缩短以下文本约{llm_percentage:.0f}%
 
 当前文本: "{current_text}"
 原始含义参考: "{original_text}"
-
-删减要求:
-- 需要减少约{duration_diff_ms:.0f}毫秒的朗读时间
-- 只删除{word_count}个左右的词，不要多删
-- 优先删除: 副词(very, really, just)、冗余修饰词、语气词
-- 禁止删除: 核心动词、主语、关键名词
-- 保持句子语法正确和自然
 
 直接返回修改后的{language_name}文本:"""
         else:
-            user_prompt = f"""请精确地延长以下{language_name}文本，只增加{word_count}个词左右。
+            target_word_count = current_word_count + llm_estimated_words
+            user_prompt = f"""请延长以下文本约{llm_percentage:.0f}%
 
 当前文本: "{current_text}"
 原始含义参考: "{original_text}"
-
-增加要求:
-- 需要增加约{abs(duration_diff_ms):.0f}毫秒的朗读时间
-- 只增加{word_count}个左右的词，不要多加
-- 可以添加: 适当的修饰词、连接词、程度副词
-- 禁止: 改变原意、添加新信息、过度修饰
-- 保持句子语法正确和自然
 
 直接返回修改后的{language_name}文本:"""
 
@@ -286,8 +306,8 @@ class TextOptimizer:
                 result = result.strip()
                 result = self._clean_response_text(result)
                 
-                # 验证修改是否合理
-                if self._validate_optimization(current_text, result, word_count):
+                # 验证修改是否合理（用实际需要的比例验证，而非告诉LLM的打折比例）
+                if self._validate_optimization(current_text, result, actual_percentage, actual_estimated_words):
                     return result
                 else:
                     logger.warning(f"优化结果验证失败，修改幅度可能过大")
@@ -296,17 +316,18 @@ class TextOptimizer:
             return None
             
         except Exception as e:
-            logger.error(f"精确控制LLM调用失败: {e}")
+            logger.error(f"比例控制LLM调用失败: {e}")
             return None
     
-    def _validate_optimization(self, original: str, optimized: str, expected_word_diff: int) -> bool:
+    def _validate_optimization(self, original: str, optimized: str, expected_percentage: float, expected_words: int) -> bool:
         """
-        验证优化结果是否合理
+        验证优化结果是否合理（基于比例）
         
         Args:
             original: 原始文本
             optimized: 优化后文本
-            expected_word_diff: 预期的词数差异
+            expected_percentage: 预期的调整比例(%)
+            expected_words: 预期的词数差异
             
         Returns:
             是否合理
@@ -315,9 +336,18 @@ class TextOptimizer:
         optimized_words = len(optimized.split())
         actual_diff = abs(original_words - optimized_words)
         
-        # 允许±2的误差
-        if actual_diff > expected_word_diff + 2:
-            logger.warning(f"词数变化过大: 预期{expected_word_diff}词，实际{actual_diff}词")
+        # 计算实际变化比例
+        if original_words > 0:
+            actual_percentage = (actual_diff / original_words) * 100
+        else:
+            actual_percentage = 0
+        
+        # 允许比预期多调整50%的幅度（更宽松的验证）
+        max_allowed_percentage = expected_percentage * 1.5
+        max_allowed_words = int(expected_words * 1.5) + 2
+        
+        if actual_diff > max_allowed_words:
+            logger.warning(f"词数变化过大: 预期{expected_words}词({expected_percentage:.0f}%)，实际{actual_diff}词({actual_percentage:.0f}%)")
             return False
         
         return True
@@ -375,8 +405,8 @@ class TextOptimizer:
         # 计算需要调整的词数（取整）
         word_adjustment = int(duration_diff * wps)
         
-        # 限制调整幅度，避免过度修改
-        max_adjustment = 5
+        # 限制调整幅度，激进模式允许更多修改
+        max_adjustment = 10
         word_adjustment = max(-max_adjustment, min(max_adjustment, word_adjustment))
         
         return word_adjustment

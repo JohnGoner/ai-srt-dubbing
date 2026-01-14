@@ -264,7 +264,8 @@ class SubtitleSegmenter:
         pre_segments = []
         current_group = []
         current_text = ""
-        current_start = 0
+        # 从第一个字幕片段的开始时间开始，而不是从0开始
+        current_start = segments[0]['start'] if segments else 0
         
         for i, seg in enumerate(segments):
             current_group.append(i + 1)  # 原始片段编号从1开始

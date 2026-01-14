@@ -127,6 +127,23 @@ class AudioConfirmationView:
         total_segments = len(confirmation_segments)
         if 'current_confirmation_index' not in st.session_state:
             st.session_state.current_confirmation_index = 0
+        
+        # 自动跳转到第一个未确认的片段
+        # 当当前片段已确认时，自动跳到下一个未确认片段
+        current_idx = st.session_state.current_confirmation_index
+        if current_idx < total_segments and confirmation_segments[current_idx].confirmed:
+            # 寻找第一个未确认的片段
+            first_unconfirmed_index = None
+            for i, seg in enumerate(confirmation_segments):
+                if not seg.confirmed:
+                    first_unconfirmed_index = i
+                    break
+            
+            # 如果找到未确认片段，跳转过去
+            if first_unconfirmed_index is not None:
+                st.session_state.current_confirmation_index = first_unconfirmed_index
+                logger.info(f"自动跳转到未确认片段: {first_unconfirmed_index + 1}/{total_segments}")
+                st.toast(f"🎯 自动跳转到第 {first_unconfirmed_index + 1} 个未确认片段")
 
         current_index = st.session_state.current_confirmation_index
 
@@ -781,14 +798,15 @@ class AudioConfirmationView:
                 # 获取原始文本
                 original_text = segment.original_text or segment.translated_text or current_text
                 
-                # 单次调用优化器
+                # 单次调用优化器（用户主动点击时强制优化）
                 optimized_text = optimizer.optimize_text_for_duration(
                     original_text=original_text,
                     current_text=current_text,
                     target_duration=segment.target_duration,
                     actual_duration=segment.actual_duration,
                     target_language=target_lang,
-                    original_language='zh'
+                    original_language='zh',
+                    force=True  # 用户主动点击，强制尝试优化
                 )
                 
                 if optimized_text and optimized_text != current_text:
@@ -814,7 +832,9 @@ class AudioConfirmationView:
                     st.rerun()
                     
                 elif optimized_text == current_text:
-                    st.info("ℹ️ 当前文本已经是最优状态")
+                    # LLM认为当前文本无需修改
+                    duration_diff_ms = (segment.actual_duration - segment.target_duration) * 1000
+                    st.warning(f"⚠️ AI未能优化文本（时长差{duration_diff_ms:+.0f}ms），您可尝试手动调整")
                 else:
                     st.error("❌ 文本优化失败")
                     
@@ -828,7 +848,7 @@ class AudioConfirmationView:
         
         逻辑：
         1. 第一次用当前文本+语速生成时长
-        2. 如果时长相比目标时长浮动在5%内，微调50%语速；>5%则智能优化文本；符合标准直接输出
+        2. 如果时长相比目标时长浮动在10%内，微调50%语速；>10%则智能优化文本；符合标准直接输出
         3. 三轮迭代后输出最优结果（小于目标时长150ms的误差最小的）
         """
         from tts import create_tts_engine
@@ -910,16 +930,17 @@ class AudioConfirmationView:
                 logger.info(f"使用现有数据: 时长={existing_duration:.2f}s, 误差={existing_error_ms:.0f}ms, 开始优化...")
                 
                 # 先根据现有数据调整策略
-                if existing_error_percentage <= 5:
-                    # 误差小，只需微调语速
+                # 只有误差>10%且>2秒才触发文本优化
+                if existing_error_percentage <= 10 or abs(existing_error_ms) <= 2000:
+                    # 误差小（10%内或2秒内），只需微调语速
                     ideal_rate = existing_duration / target_duration * current_rate
                     adjustment = (ideal_rate - current_rate) * 0.5
                     current_rate = max(0.95, min(1.15, current_rate + adjustment))
-                    logger.info(f"基于现有数据微调语速至 {current_rate:.2f}x")
+                    logger.info(f"基于现有数据微调语速至 {current_rate:.2f}x (误差{existing_error_percentage:.1f}%, {existing_error_ms:.0f}ms)")
                 else:
-                    # 误差大，需要优化文本
+                    # 误差大（>10%且>2秒），需要优化文本
                     with progress_container:
-                        st.info(f"📝 误差>{5}%，正在优化文本...")
+                        st.info(f"📝 误差>{10}%且>{2}秒，正在优化文本...")
                     
                     optimized_text = optimizer.optimize_text_for_duration(
                         original_text=original_text,
@@ -933,13 +954,6 @@ class AudioConfirmationView:
                     if optimized_text and optimized_text != current_text:
                         current_text = optimized_text
                         logger.info(f"基于现有数据优化文本完成")
-                    
-                    # 误差>2秒时同时调整语速
-                    if abs(existing_error_ms) > 2000:
-                        ideal_rate = existing_duration / target_duration * current_rate
-                        adjustment = (ideal_rate - current_rate) * 0.5
-                        current_rate = max(0.95, min(1.15, current_rate + adjustment))
-                        logger.info(f"误差较大，同时调整语速至 {current_rate:.2f}x")
             
             for iteration in range(3):
                 with progress_container:
@@ -1000,24 +1014,20 @@ class AudioConfirmationView:
                     break
                 
                 # 决定下一轮的优化策略
+                # 只有误差>10%且>2秒才触发文本优化
                 next_strategy = ""
-                if error_percentage <= 5:
-                    # 浮动在5%内，微调语速（调整50%）
-                    if error_ms > 0:
-                        ideal_rate = actual_duration / target_duration * current_rate
-                        adjustment = (ideal_rate - current_rate) * 0.5
-                        current_rate = max(0.95, min(1.15, current_rate + adjustment))
-                    else:
-                        ideal_rate = actual_duration / target_duration * current_rate
-                        adjustment = (ideal_rate - current_rate) * 0.5
-                        current_rate = max(0.95, min(1.15, current_rate + adjustment))
+                if error_percentage <= 10 or abs(error_ms) <= 2000:
+                    # 误差小（10%内或2秒内），微调语速（调整50%）
+                    ideal_rate = actual_duration / target_duration * current_rate
+                    adjustment = (ideal_rate - current_rate) * 0.5
+                    current_rate = max(0.95, min(1.15, current_rate + adjustment))
                     
                     next_strategy = f"微调语速 → {current_rate:.2f}x"
-                    logger.info(f"微调语速至 {current_rate:.2f}x")
+                    logger.info(f"微调语速至 {current_rate:.2f}x (误差{error_percentage:.1f}%, {error_ms:.0f}ms)")
                 else:
-                    # 浮动>5%，进入智能优化文本逻辑
+                    # 误差大（>10%且>2秒），进入智能优化文本逻辑
                     with progress_container:
-                        st.info(f"📝 误差>{5}%，正在优化文本...")
+                        st.info(f"📝 误差>{10}%且>{2}秒，正在优化文本...")
                     
                     optimized_text = optimizer.optimize_text_for_duration(
                         original_text=original_text,
@@ -1031,34 +1041,16 @@ class AudioConfirmationView:
                     text_changed = optimized_text and optimized_text != current_text
                     if text_changed:
                         current_text = optimized_text
-                    
-                    # 误差较大时（>2秒），同时调整语速加速收敛
-                    if abs(error_ms) > 2000:
-                        # 计算建议语速，但只调整50%幅度
-                        ideal_rate = actual_duration / target_duration * current_rate
-                        adjustment = (ideal_rate - current_rate) * 0.5
-                        new_rate = max(0.95, min(1.15, current_rate + adjustment))
-                        
-                        if text_changed:
-                            next_strategy = f"文本已优化 + 语速 → {new_rate:.2f}x"
-                            logger.info(f"文本已优化，同时调整语速 {current_rate:.2f} → {new_rate:.2f}x")
-                        else:
-                            next_strategy = f"文本无变化，语速 → {new_rate:.2f}x"
-                            logger.info(f"文本无变化，调整语速至 {new_rate:.2f}x")
-                        current_rate = new_rate
+                        next_strategy = "文本已优化"
+                        logger.info(f"文本已优化，保持语速 {current_rate:.2f}x")
                     else:
-                        # 误差不大，只做文本优化
-                        if text_changed:
-                            next_strategy = "文本已优化"
-                            logger.info(f"文本已优化，保持语速 {current_rate:.2f}x")
+                        # 文本没变化，微调语速
+                        if error_ms > 0:
+                            current_rate = min(1.15, current_rate + 0.03)
                         else:
-                            # 文本也没变化，微调语速
-                            if error_ms > 0:
-                                current_rate = min(1.15, current_rate + 0.03)
-                            else:
-                                current_rate = max(0.95, current_rate - 0.03)
-                            next_strategy = f"微调语速 → {current_rate:.2f}x"
-                            logger.info(f"文本无变化，微调语速至 {current_rate:.2f}x")
+                            current_rate = max(0.95, current_rate - 0.03)
+                        next_strategy = f"微调语速 → {current_rate:.2f}x"
+                        logger.info(f"文本无变化，微调语速至 {current_rate:.2f}x")
                 
                 # 显示下一步策略
                 if iteration < 2 and next_strategy:

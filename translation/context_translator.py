@@ -115,6 +115,32 @@ class ContextTranslator:
         # 从环境变量或配置中获取认证信息
         credentials_path = self.config.get('api_keys', {}).get('google_credentials_path')
         if credentials_path:
+            # 如果是相对路径，尝试在多个位置查找
+            if not os.path.isabs(credentials_path):
+                # 获取当前脚本所在目录（ai-srt-dubbing/translation/）
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                # 项目根目录（ai-srt-dubbing/）
+                project_root = os.path.dirname(script_dir)
+                
+                # 按优先级尝试多个可能的路径
+                possible_paths = [
+                    credentials_path,  # 当前工作目录
+                    os.path.join(project_root, credentials_path),  # 项目根目录
+                    os.path.join(script_dir, credentials_path),  # 脚本目录
+                ]
+                
+                found_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        found_path = os.path.abspath(path)
+                        logger.info(f"找到Google凭证文件: {found_path}")
+                        break
+                
+                if found_path:
+                    credentials_path = found_path
+                else:
+                    logger.warning(f"在以下路径均未找到凭证文件: {possible_paths}")
+            
             os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials_path
         
         try:

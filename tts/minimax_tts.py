@@ -61,7 +61,8 @@ class MinimaxTTS:
         # 基础语音参数
         self.base_speech_rate = self.tts_config.get('speech_rate', 1.0)
         self.pitch = self.tts_config.get('pitch', 0)
-        self.volume = self.tts_config.get('volume', 1.0)
+        # 优先使用 minimax 专属音量配置，否则使用通用音量配置
+        self.volume = minimax_config.get('volume', self.tts_config.get('volume', 1.0))
         
         # 停顿时长配置（可在config.yaml中调整）
         pause_config = self.tts_config.get('minimax', {}).get('pause_settings', {})

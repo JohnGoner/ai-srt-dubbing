@@ -914,9 +914,20 @@ class WorkflowManager:
             # 合并音频
             final_audio = audio_synthesizer.merge_confirmed_audio_segments(legacy_segments)
             
-            # 保存文件
-            audio_output = f"dubbed_audio_{target_lang}.wav"
-            subtitle_output = f"translated_subtitle_{target_lang}.srt"
+            # 获取工程名用于输出文件命名
+            current_project = session_data.get('current_project')
+            project_name = getattr(current_project, 'name', None) if current_project else None
+            
+            # 如果没有工程名，使用默认名称
+            if not project_name:
+                project_name = f"dubbed_audio_{target_lang}"
+            
+            # 清理文件名中的非法字符
+            safe_project_name = "".join(c if c.isalnum() or c in ('-', '_', ' ', '.') else '_' for c in project_name)
+            
+            # 保存文件 - 使用工程名作为文件名
+            audio_output = f"{safe_project_name}_{target_lang}.wav"
+            subtitle_output = f"{safe_project_name}_{target_lang}.srt"
             
             # Windows系统优化的音频导出
             import platform
@@ -1013,6 +1024,7 @@ class WorkflowManager:
                 'audio_data': audio_data,
                 'subtitle_data': subtitle_data,
                 'target_lang': target_lang,
+                'project_name': safe_project_name,  # 工程名用于下载文件命名
                 'optimized_segments': [seg.to_legacy_dict() for seg in confirmed_segments],  # 使用用户确认后的segments
                 'cost_summary': tts_cost_summary,  # 保持向后兼容
                 'api_usage_summary': combined_api_usage,  # 新的综合统计
