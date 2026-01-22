@@ -16,13 +16,32 @@ from utils.project_manager import get_project_manager
 from models.project_dto import ProjectDTO
 
 
+def _get_current_user_id() -> str:
+    """获取当前用户 ID（从 session_state）"""
+    auth_username = st.session_state.get('auth_username')
+    if auth_username:
+        return auth_username
+    return 'default_user'
+
+
 class ProjectManagementView:
     """工程管理视图组件"""
     
     def __init__(self):
         """初始化工程管理视图"""
-        self.project_integration = get_project_integration()
-        self.project_manager = get_project_manager()
+        # 使用属性动态获取，以支持用户切换
+        pass
+    
+    @property
+    def project_integration(self):
+        """动态获取当前用户的工程集成实例"""
+        user_id = _get_current_user_id()
+        return get_project_integration(user_id=user_id)
+    
+    @property
+    def project_manager(self):
+        """动态获取当前用户的工程管理器"""
+        return self.project_integration.project_manager
     
     def render_project_home(self) -> Dict[str, Any]:
         """
@@ -439,6 +458,12 @@ class ProjectManagementView:
             st.subheader("📋 可选择的处理阶段")
             
             for stage_key, stage_info in available_stages.items():
+                status = stage_info["status"]
+                
+                # 跳过隐藏的阶段（如 translating 这类过渡状态）
+                if status == "hidden":
+                    continue
+                
                 with st.container():
                     col1, col2 = st.columns([3, 1])
                     
@@ -446,7 +471,6 @@ class ProjectManagementView:
                         # 显示阶段信息
                         icon = stage_info["icon"]
                         name = stage_info["name"]
-                        status = stage_info["status"]
                         
                         if status == "completed":
                             st.success(f"{icon} **{name}** ✅")
@@ -454,7 +478,7 @@ class ProjectManagementView:
                         elif status == "available":
                             st.info(f"{icon} **{name}**")
 
-                        else:
+                        else:  # not_available
                             st.warning(f"{icon} **{name}** ⚠️")
                             st.text(f"   (需要先完成前置阶段)")
                     

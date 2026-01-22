@@ -332,5 +332,31 @@ class ConfigManager:
                 "log_file": "logs/dubbing.log",
                 "max_log_size": "10MB",
                 "backup_count": 5
+            },
+            # Firebase 云端存储配置
+            "firebase": {
+                "enabled": False,  # 是否启用 Firebase 云端存储
+                "credentials_path": "",  # Firebase 凭证文件路径
+                "storage_bucket": "",  # Firebase Storage Bucket 名称
+                "project_id": ""  # Firebase 项目 ID
+            },
+            # 存储后端配置
+            "storage": {
+                "backend": "local",  # "local" 或 "firebase"
+                "local_path": "",  # 本地存储路径（为空则使用默认）
+                "audio_format": "mp3",  # 音频存储格式
+                "audio_bitrate": "128k"  # 音频比特率
             }
-        } 
+        }
+    
+    def is_firebase_enabled(self) -> bool:
+        """检查是否启用了 Firebase"""
+        if not self.config:
+            return False
+        return self.config.get('firebase', {}).get('enabled', False)
+    
+    def get_storage_backend(self) -> str:
+        """获取存储后端类型"""
+        if not self.config:
+            return "local"
+        return self.config.get('storage', {}).get('backend', 'local') 

@@ -1,6 +1,7 @@
 """
 工程数据模型 - ProjectDTO
 管理AI配音工程的完整状态和数据
+支持本地存储和 Firebase Firestore 云端存储
 """
 
 import json
@@ -68,7 +69,20 @@ class ProjectDTO:
     # 共享信息
     is_shared: bool = False                     # 是否共享
     share_url: str = ""                        # 分享链接
-    created_by: str = ""                       # 创建者
+    created_by: str = ""                       # 创建者（向后兼容）
+    
+    # Firebase 用户隔离
+    owner_id: str = ""                          # 所属用户 ID（Firebase 用户隔离）
+    storage_backend: str = "local"              # 存储后端: "local" 或 "firebase"
+    audio_storage_paths: Dict[str, str] = field(default_factory=dict)  # 音频文件云端路径映射
+    
+    # 最终输出文件存储路径（Firebase Storage）
+    final_audio_storage_path: str = ""          # 最终音频文件云端路径
+    final_subtitle_storage_path: str = ""       # 最终字幕文件云端路径
+    
+    # TTS 配置
+    tts_service: str = ""                       # 使用的 TTS 服务 (minimax/elevenlabs)
+    tts_voice_id: str = ""                      # 使用的音色 ID
     
     def __post_init__(self):
         """初始化后处理"""
@@ -322,4 +336,197 @@ class ProjectDTO:
             'updated_at': self.updated_at,
             'is_shared': self.is_shared,
             'tags': self.tags
+        }
+    
+    # ==================== Firebase/Firestore 支持 ====================
+    
+    def set_owner(self, user_id: str):
+        """设置项目所有者"""
+        self.owner_id = user_id
+        # 向后兼容
+        if not self.created_by:
+            self.created_by = user_id
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+    
+    def to_firestore_dict(self) -> Dict[str, Any]:
+        """
+        转换为 Firestore 兼容的字典格式
+        - 移除不可序列化的对象（如 AudioSegment）
+        - 移除不需要持久化的调试数据（节省存储空间）
+        - 移除重复的向后兼容字段
+        - 清理空值和 None
+        
+        Returns:
+            Firestore 兼容的字典
+        """
+        data = asdict(self)
+        
+        # === 优化：定义需要从 segment 中移除的字段 ===
+        # 1. 调试/临时数据（用完即弃，不需要持久化）
+        # 2. 重复的向后兼容字段
+        SEGMENT_FIELDS_TO_EXCLUDE = {
+            # 调试数据 - UI 展示用，确认后无需保存
+            'timing_analysis',        # 时长分析详情，约 200 字节/段
+            'adjustment_suggestions', # 调整建议列表，约 300+ 字节/段
+            'processing_metadata',    # 临时处理元数据
+            # 重复字段 - 与其他字段完全相同
+            'text',                   # 与 original_text 重复
+            'duration',               # 与 target_duration 重复
+            'text_modified',          # 与 user_modified 重复
+            # 不可序列化
+            'audio_data',             # AudioSegment 对象
+        }
+        
+        segment_fields = [
+            'segments', 'segmented_segments', 'confirmed_segments',
+            'translated_segments', 'optimized_segments', 'final_segments'
+        ]
+        
+        for field_name in segment_fields:
+            if field_name in data and data[field_name]:
+                cleaned_segments = []
+                for seg in data[field_name]:
+                    if isinstance(seg, dict):
+                        # 移除不需要的字段
+                        clean_seg = {
+                            k: v for k, v in seg.items() 
+                            if k not in SEGMENT_FIELDS_TO_EXCLUDE
+                        }
+                        # 移除空值（空字符串、空列表、空字典）以节省空间
+                        clean_seg = {
+                            k: v for k, v in clean_seg.items() 
+                            if v not in [None, "", [], {}]
+                        }
+                        # 确保 audio_path 存在（用于 Firebase Storage 引用）
+                        if 'audio_path' not in clean_seg:
+                            clean_seg['audio_path'] = None
+                        cleaned_segments.append(clean_seg)
+                    else:
+                        cleaned_segments.append(seg)
+                data[field_name] = cleaned_segments
+        
+        # 确保所有值都是 Firestore 兼容的类型
+        data = self._clean_for_firestore(data)
+        
+        return data
+    
+    def _clean_for_firestore(self, data: Any) -> Any:
+        """
+        递归清理数据，确保 Firestore 兼容
+        """
+        if data is None:
+            return None
+        elif isinstance(data, dict):
+            return {k: self._clean_for_firestore(v) for k, v in data.items() if v is not None}
+        elif isinstance(data, list):
+            return [self._clean_for_firestore(item) for item in data if item is not None]
+        elif isinstance(data, (str, int, float, bool)):
+            return data
+        elif hasattr(data, '__class__') and data.__class__.__name__ == 'AudioSegment':
+            # AudioSegment 对象不存储
+            return None
+        else:
+            # 尝试转换为字符串
+            try:
+                return str(data)
+            except:
+                return None
+    
+    @classmethod
+    def from_firestore_dict(cls, data: Dict[str, Any]) -> 'ProjectDTO':
+        """
+        从 Firestore 文档创建 ProjectDTO 对象
+        
+        Args:
+            data: Firestore 文档数据
+            
+        Returns:
+            ProjectDTO 实例
+        """
+        # 移除 Firestore 特有的字段
+        clean_data = {k: v for k, v in data.items() if not k.startswith('_')}
+        
+        # 处理可能缺失的新字段（向后兼容）
+        if 'owner_id' not in clean_data:
+            clean_data['owner_id'] = clean_data.get('created_by', '')
+        if 'storage_backend' not in clean_data:
+            clean_data['storage_backend'] = 'firebase'
+        if 'audio_storage_paths' not in clean_data:
+            clean_data['audio_storage_paths'] = {}
+        
+        return cls(**clean_data)
+    
+    def get_index_entry(self) -> Dict[str, Any]:
+        """
+        获取用于索引的简化数据（用于 Firestore 索引集合）
+        
+        Returns:
+            索引条目字典
+        """
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description[:200] if self.description else '',
+            'owner_id': self.owner_id,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
+            'processing_stage': self.processing_stage,
+            'completion_percentage': self.completion_percentage,
+            'target_language': self.target_language,
+            'total_segments': self.total_segments,
+            'total_duration': self.total_duration,
+            'original_filename': self.original_filename,
+            'file_size': self.file_size,
+            'tags': self.tags,
+            'category': self.category,
+            'is_shared': self.is_shared,
+            'storage_backend': self.storage_backend
+        }
+    
+    def update_audio_storage_path(self, segment_id: str, storage_path: str):
+        """
+        更新片段的音频存储路径（Firebase Storage）
+        
+        Args:
+            segment_id: 片段 ID
+            storage_path: Firebase Storage 路径
+        """
+        self.audio_storage_paths[segment_id] = storage_path
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+    
+    def get_audio_storage_path(self, segment_id: str) -> Optional[str]:
+        """获取片段的音频存储路径"""
+        return self.audio_storage_paths.get(segment_id)
+    
+    def set_final_output_paths(self, audio_path: str = "", subtitle_path: str = ""):
+        """
+        设置最终输出文件的云端存储路径
+        
+        Args:
+            audio_path: 最终音频文件的 Firebase Storage 路径
+            subtitle_path: 最终字幕文件的 Firebase Storage 路径
+        """
+        if audio_path:
+            self.final_audio_storage_path = audio_path
+        if subtitle_path:
+            self.final_subtitle_storage_path = subtitle_path
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+    
+    def set_tts_config(self, service: str, voice_id: str = ""):
+        """
+        设置 TTS 服务配置
+        
+        Args:
+            service: TTS 服务名称 (minimax/elevenlabs)
+            voice_id: 使用的音色 ID
+        """
+        self.tts_service = service
+        self.tts_voice_id = voice_id
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+    
+    def get_tts_config(self) -> Dict[str, str]:
+        """获取 TTS 服务配置"""
+        return {
+            'service': self.tts_service,
+            'voice_id': self.tts_voice_id
         }

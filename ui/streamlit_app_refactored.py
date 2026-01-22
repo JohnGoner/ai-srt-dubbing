@@ -26,6 +26,84 @@ from utils.logger_config import setup_logging
 from utils.project_integration import get_project_integration
 
 
+def get_current_user_id() -> str:
+    """
+    获取当前登录用户的 ID（用于 Firebase 数据隔离）
+    
+    对于 Firebase Auth 用户，使用 UID（唯一标识符）
+    对于本地配置用户，使用用户名
+    
+    Returns:
+        用户 ID，未登录时返回 'anonymous'
+    """
+    # 首先检查是否已认证
+    if not st.session_state.get('authenticated', False):
+        # 未认证状态下，检查是否启用认证
+        try:
+            from utils.config_manager import get_global_config_manager
+            config_manager = get_global_config_manager()
+            config = config_manager.load_config()
+            security_config = config.get('security', {}) if config else {}
+            
+            # 如果未启用认证，使用默认用户
+            if not security_config.get('enable_auth', False):
+                return 'default_user'
+        except Exception:
+            pass
+        
+        # 启用认证但未登录，返回 anonymous
+        return 'anonymous'
+    
+    # 已认证用户
+    # Firebase Auth 用户：使用 UID
+    auth_provider = st.session_state.get('auth_provider')
+    if auth_provider == 'firebase':
+        # auth_username 在 Firebase 模式下存储的是 UID
+        uid = st.session_state.get('auth_username')
+        if uid:
+            return uid
+    
+    # 本地配置用户：使用用户名
+    auth_username = st.session_state.get('auth_username')
+    if auth_username:
+        return auth_username
+    
+    return 'anonymous'
+
+
+def get_current_display_name() -> str:
+    """
+    获取当前用户的显示名称
+    
+    Returns:
+        显示名称
+    """
+    # 首先检查是否已认证
+    if not st.session_state.get('authenticated', False):
+        return '访客'
+    
+    display_name = st.session_state.get('auth_display_name')
+    if display_name:
+        return display_name
+    
+    auth_username = st.session_state.get('auth_username')
+    if auth_username:
+        return auth_username
+    
+    return '访客'
+
+
+def get_user_project_integration():
+    """
+    获取当前用户的工程集成实例（自动关联 Firebase 用户 ID）
+    
+    Returns:
+        ProjectIntegration 实例（已关联当前用户）
+    """
+    user_id = get_current_user_id()
+    return get_project_integration(user_id=user_id)
+
+
 def check_authentication() -> bool:
     """
     检查用户认证状态
@@ -120,7 +198,7 @@ def _record_login_attempt(username: str, success: bool, security_config: dict):
 
 def _verify_user(username: str, password: str, security_config: dict) -> tuple:
     """
-    验证用户凭据
+    验证用户凭据（本地配置模式）
     
     Returns:
         (success, message, user_info)
@@ -161,14 +239,105 @@ def _verify_user(username: str, password: str, security_config: dict) -> tuple:
         return False, "密码错误", None
 
 
+def _verify_user_firebase(email: str, password: str, config: dict) -> tuple:
+    """
+    使用 Firebase Auth 验证用户
+    
+    Returns:
+        (success, message, user_info)
+    """
+    try:
+        from utils.firebase_auth import get_firebase_auth, initialize_firebase_auth
+        
+        # 初始化 Firebase Auth
+        auth_manager = get_firebase_auth()
+        if not auth_manager.is_connected:
+            if not initialize_firebase_auth(config):
+                return False, "Firebase Auth 初始化失败", None
+        
+        # 登录
+        success, message, user_info = auth_manager.login_with_email(email, password)
+        
+        if success:
+            return True, message, {
+                'username': user_info['display_name'],
+                'uid': user_info['uid'],
+                'email': user_info['email'],
+                'role': 'user',  # Firebase 用户默认角色
+                'id_token': user_info['id_token'],
+                'refresh_token': user_info['refresh_token'],
+                'auth_provider': 'firebase'
+            }
+        else:
+            return False, message, None
+            
+    except ImportError:
+        return False, "Firebase Auth 模块未安装", None
+    except Exception as e:
+        logger.error(f"Firebase Auth 验证失败: {e}")
+        return False, f"验证失败: {str(e)}", None
+
+
+def _register_user_firebase(email: str, password: str, display_name: str, config: dict) -> tuple:
+    """
+    使用 Firebase Auth 注册新用户
+    
+    Returns:
+        (success, message, user_info)
+    """
+    try:
+        from utils.firebase_auth import get_firebase_auth, initialize_firebase_auth
+        
+        # 初始化 Firebase Auth
+        auth_manager = get_firebase_auth()
+        if not auth_manager.is_connected:
+            if not initialize_firebase_auth(config):
+                return False, "Firebase Auth 初始化失败", None
+        
+        # 注册
+        success, message, user_info = auth_manager.register_with_email(email, password, display_name)
+        
+        if success:
+            return True, message, {
+                'username': user_info['display_name'],
+                'uid': user_info['uid'],
+                'email': user_info['email'],
+                'role': 'user',
+                'id_token': user_info['id_token'],
+                'refresh_token': user_info['refresh_token'],
+                'auth_provider': 'firebase'
+            }
+        else:
+            return False, message, None
+            
+    except ImportError:
+        return False, "Firebase Auth 模块未安装", None
+    except Exception as e:
+        logger.error(f"Firebase Auth 注册失败: {e}")
+        return False, f"注册失败: {str(e)}", None
+
+
 def show_login_page():
-    """显示登录页面"""
+    """
+    显示登录页面（旧版入口，包含 set_page_config）
+    注意：此函数只应在独立调用时使用，不要在 main() 中调用
+    """
     st.set_page_config(
         page_title="AI配音系统 - 登录",
         page_icon="🔐",
         layout="centered"
     )
+    show_login_page_content()
+
+
+def show_login_page_content():
+    """
+    显示登录页面内容（不含 set_page_config）
     
+    支持两种认证模式：
+    1. Firebase Auth（推荐）：支持注册、密码重置
+    2. 本地配置：使用 config.yaml 中的用户配置
+    """
     # 登录页面样式
     st.markdown("""
     <style>
@@ -193,14 +362,20 @@ def show_login_page():
         border-radius: 8px;
         background: rgba(128, 128, 128, 0.1);
     }
+    .auth-tabs {
+        margin-bottom: 1.5rem;
+    }
+    .register-link {
+        text-align: center;
+        margin-top: 1rem;
+        font-size: 0.9rem;
+    }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
     
-    st.markdown("<div class='login-title'><h1>🔐 AI配音系统</h1><p>请输入您的账号信息</p></div>", unsafe_allow_html=True)
-    
-    # 获取安全配置
+    # 获取配置
     try:
         from utils.config_manager import get_global_config_manager
         config_manager = get_global_config_manager()
@@ -210,6 +385,182 @@ def show_login_page():
         logger.error(f"读取安全配置失败: {e}")
         st.error("系统配置错误，请联系管理员")
         return
+    
+    # 检查认证模式
+    use_firebase_auth = security_config.get('use_firebase_auth', False)
+    
+    if use_firebase_auth:
+        _show_firebase_login_page(config, security_config)
+    else:
+        _show_local_login_page(security_config)
+
+
+def _show_firebase_login_page(config: dict, security_config: dict):
+    """显示 Firebase Auth 登录页面（支持注册和密码重置）"""
+    
+    # 初始化页面状态
+    if 'auth_page_mode' not in st.session_state:
+        st.session_state['auth_page_mode'] = 'login'
+    
+    page_mode = st.session_state['auth_page_mode']
+    
+    # 页面标题
+    if page_mode == 'login':
+        st.markdown("<div class='login-title'><h1>🔐 AI配音系统</h1><p>登录您的账号</p></div>", unsafe_allow_html=True)
+    elif page_mode == 'register':
+        st.markdown("<div class='login-title'><h1>📝 注册账号</h1><p>创建您的AI配音系统账号</p></div>", unsafe_allow_html=True)
+    elif page_mode == 'reset':
+        st.markdown("<div class='login-title'><h1>🔑 重置密码</h1><p>输入邮箱以接收重置链接</p></div>", unsafe_allow_html=True)
+    
+    # ===== 登录模式 =====
+    if page_mode == 'login':
+        email = st.text_input("📧 邮箱", key="firebase_email", placeholder="请输入邮箱地址")
+        password = st.text_input("🔒 密码", type="password", key="firebase_password", placeholder="请输入密码")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("登录", use_container_width=True, type="primary", key="firebase_login_btn"):
+                if not email:
+                    st.error("请输入邮箱")
+                    return
+                if not password:
+                    st.error("请输入密码")
+                    return
+                
+                with st.spinner("正在登录..."):
+                    success, message, user_info = _verify_user_firebase(email, password, config)
+                
+                if success:
+                    # 设置登录状态
+                    st.session_state['authenticated'] = True
+                    st.session_state['auth_time'] = time.time()
+                    st.session_state['auth_username'] = user_info.get('uid')  # 使用 UID 作为唯一标识
+                    st.session_state['auth_display_name'] = user_info.get('username', email.split('@')[0])
+                    st.session_state['auth_email'] = user_info.get('email')
+                    st.session_state['auth_role'] = user_info.get('role', 'user')
+                    st.session_state['auth_provider'] = 'firebase'
+                    st.session_state['firebase_id_token'] = user_info.get('id_token')
+                    st.session_state['firebase_refresh_token'] = user_info.get('refresh_token')
+                    
+                    logger.info(f"Firebase 用户登录成功 - Email: {email}, UID: {user_info.get('uid')}")
+                    st.success(f"✅ 登录成功，欢迎 {st.session_state['auth_display_name']}！")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {message}")
+        
+        # 注册和忘记密码链接
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📝 注册新账号", use_container_width=True, key="goto_register"):
+                st.session_state['auth_page_mode'] = 'register'
+                st.rerun()
+        with col2:
+            if st.button("🔑 忘记密码？", use_container_width=True, key="goto_reset"):
+                st.session_state['auth_page_mode'] = 'reset'
+                st.rerun()
+    
+    # ===== 注册模式 =====
+    elif page_mode == 'register':
+        display_name = st.text_input("👤 显示名称", key="reg_display_name", placeholder="您希望显示的名称")
+        email = st.text_input("📧 邮箱", key="reg_email", placeholder="请输入邮箱地址")
+        password = st.text_input("🔒 密码", type="password", key="reg_password", placeholder="至少 6 位字符")
+        confirm_password = st.text_input("🔒 确认密码", type="password", key="reg_confirm", placeholder="再次输入密码")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("注册", use_container_width=True, type="primary", key="firebase_register_btn"):
+                if not email:
+                    st.error("请输入邮箱")
+                    return
+                if not password:
+                    st.error("请输入密码")
+                    return
+                if len(password) < 6:
+                    st.error("密码长度至少为 6 位")
+                    return
+                if password != confirm_password:
+                    st.error("两次输入的密码不一致")
+                    return
+                
+                with st.spinner("正在注册..."):
+                    success, message, user_info = _register_user_firebase(
+                        email, password, display_name or email.split('@')[0], config
+                    )
+                
+                if success:
+                    # 注册成功后自动登录
+                    st.session_state['authenticated'] = True
+                    st.session_state['auth_time'] = time.time()
+                    st.session_state['auth_username'] = user_info.get('uid')
+                    st.session_state['auth_display_name'] = user_info.get('username')
+                    st.session_state['auth_email'] = user_info.get('email')
+                    st.session_state['auth_role'] = 'user'
+                    st.session_state['auth_provider'] = 'firebase'
+                    st.session_state['firebase_id_token'] = user_info.get('id_token')
+                    st.session_state['firebase_refresh_token'] = user_info.get('refresh_token')
+                    
+                    logger.info(f"Firebase 用户注册成功 - Email: {email}, UID: {user_info.get('uid')}")
+                    st.success("✅ 注册成功！正在进入系统...")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {message}")
+        
+        # 返回登录
+        st.markdown("---")
+        if st.button("⬅️ 返回登录", use_container_width=True, key="back_to_login_from_reg"):
+            st.session_state['auth_page_mode'] = 'login'
+            st.rerun()
+    
+    # ===== 密码重置模式 =====
+    elif page_mode == 'reset':
+        email = st.text_input("📧 邮箱", key="reset_email", placeholder="请输入注册时使用的邮箱")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("发送重置链接", use_container_width=True, type="primary", key="firebase_reset_btn"):
+                if not email:
+                    st.error("请输入邮箱")
+                    return
+                
+                with st.spinner("正在发送..."):
+                    try:
+                        from utils.firebase_auth import get_firebase_auth, initialize_firebase_auth
+                        auth_manager = get_firebase_auth()
+                        if not auth_manager.is_connected:
+                            initialize_firebase_auth(config)
+                        
+                        success, message = auth_manager.send_password_reset_email(email)
+                        
+                        if success:
+                            st.success(f"✅ {message}")
+                            st.info("📬 请检查您的邮箱（包括垃圾邮件文件夹）")
+                        else:
+                            st.error(f"❌ {message}")
+                    except Exception as e:
+                        st.error(f"❌ 发送失败: {str(e)}")
+        
+        # 返回登录
+        st.markdown("---")
+        if st.button("⬅️ 返回登录", use_container_width=True, key="back_to_login_from_reset"):
+            st.session_state['auth_page_mode'] = 'login'
+            st.rerun()
+    
+    # 安全提示
+    st.markdown("""
+    <div class='security-notice'>
+        🛡️ 您的数据安全由 Firebase Authentication 保护<br>
+        密码经加密传输和存储
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def _show_local_login_page(security_config: dict):
+    """显示本地配置认证登录页面"""
+    
+    st.markdown("<div class='login-title'><h1>🔐 AI配音系统</h1><p>请输入您的账号信息</p></div>", unsafe_allow_html=True)
     
     # 用户名输入框
     username = st.text_input("用户名", key="login_username", placeholder="请输入用户名")
@@ -256,7 +607,9 @@ def show_login_page():
                 st.session_state['authenticated'] = True
                 st.session_state['auth_time'] = time.time()
                 st.session_state['auth_username'] = user_info.get('username', username)
+                st.session_state['auth_display_name'] = user_info.get('username', username)
                 st.session_state['auth_role'] = user_info.get('role', 'user')
+                st.session_state['auth_provider'] = 'local'
                 
                 # 记录登录日志
                 if security_config.get('log_access', True):
@@ -416,17 +769,29 @@ def clean_project_name(filename: str) -> str:
 def main():
     """主应用程序 - 纯状态机调度器"""
     
-    # 安全认证检查
-    if not check_authentication():
-        show_login_page()
-        return
+    # 🔥 关键修复：st.set_page_config() 必须是第一个 Streamlit 命令
+    # 在任何认证检查之前调用，避免注销后的配置冲突
+    is_authenticated = st.session_state.get('authenticated', False)
     
     st.set_page_config(
-        page_title="AI配音系统",
-        page_icon="🎬",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        page_title="AI配音系统 - 登录" if not is_authenticated else "AI配音系统",
+        page_icon="🔐" if not is_authenticated else "🎬",
+        layout="centered" if not is_authenticated else "wide",
+        initial_sidebar_state="collapsed" if not is_authenticated else "expanded"
     )
+    
+    # 安全认证检查
+    if not check_authentication():
+        show_login_page_content()  # 只渲染内容，不设置 page_config
+        return
+    
+    # 注册程序退出时的清理函数（仅注册一次）
+    if not st.session_state.get('_atexit_registered', False):
+        import atexit
+        from utils.project_integration import flush_all_pending_saves
+        atexit.register(flush_all_pending_saves)
+        st.session_state['_atexit_registered'] = True
+        logger.debug("已注册程序退出时的数据保存处理")
     
     # Windows系统启动时清理临时文件
     from utils.windows_audio_utils import is_windows, cleanup_windows_temp_files
@@ -503,31 +868,60 @@ def main():
         st.markdown("*智能SRT字幕翻译与配音*")
         
         # 安全注销按钮
+        # 🔥 注意：注销逻辑不能在 try-except 中，因为 st.rerun() 会被捕获
+        _config = None
+        _security_enabled = False
         try:
             from utils.config_manager import get_global_config_manager
             config_manager = get_global_config_manager()
-            config = config_manager.load_config()
-            if config and config.get('security', {}).get('enable_auth', False):
-                # 显示当前登录用户
-                auth_username = st.session_state.get('auth_username', '未知')
-                auth_role = st.session_state.get('auth_role', 'user')
-                role_display = "管理员" if auth_role == "admin" else "用户"
+            _config = config_manager.load_config()
+            _security_enabled = _config and _config.get('security', {}).get('enable_auth', False)
+        except Exception as e:
+            logger.debug(f"读取安全配置失败: {e}")
+        
+        if _security_enabled:
+            # 显示当前登录用户
+            display_name = get_current_display_name()
+            auth_provider = st.session_state.get('auth_provider', 'local')
+            auth_role = st.session_state.get('auth_role', 'user')
+            
+            # 角色和认证方式显示
+            role_display = "管理员" if auth_role == "admin" else "用户"
+            provider_icon = "🔥" if auth_provider == "firebase" else "🏠"
+            
+            st.caption(f"👤 {display_name} ({role_display}) {provider_icon}")
+            
+            # 显示邮箱（仅 Firebase 用户）
+            auth_email = st.session_state.get('auth_email')
+            if auth_email:
+                st.caption(f"📧 {auth_email}")
+            
+            if st.button("🔓 注销", key="logout_btn", help="退出登录"):
+                # 保存日志所需信息（在清理前）
+                user_id = st.session_state.get('auth_username', 'unknown')
+                current_auth_provider = st.session_state.get('auth_provider', 'local')
                 
-                st.caption(f"👤 {auth_username} ({role_display})")
+                # 清理所有认证相关的 session state（使用 del 彻底删除）
+                auth_keys = [
+                    'authenticated', 'auth_time', 'auth_username', 
+                    'auth_display_name', 'auth_email', 'auth_role', 
+                    'auth_provider', 'firebase_id_token', 'firebase_refresh_token',
+                    'auth_page_mode'
+                ]
+                for key in auth_keys:
+                    if key in st.session_state:
+                        del st.session_state[key]
                 
-                if st.button("🔓 注销", key="logout_btn", help="退出登录"):
-                    username = st.session_state.get('auth_username', 'unknown')
-                    st.session_state['authenticated'] = False
-                    st.session_state['auth_time'] = 0
-                    st.session_state['auth_username'] = None
-                    st.session_state['auth_role'] = None
-                    
-                    if config.get('security', {}).get('log_access', True):
-                        logger.info(f"用户注销 - 用户: {username}, IP: {_get_client_ip()}")
-                    st.rerun()
-                st.divider()
-        except:
-            pass
+                # 明确设置为未认证状态
+                st.session_state['authenticated'] = False
+                st.session_state['auth_time'] = 0
+                
+                if _config and _config.get('security', {}).get('log_access', True):
+                    logger.info(f"用户注销 - 用户: {user_id}, 认证方式: {current_auth_provider}, IP: {_get_client_ip()}")
+                
+                # 🔥 关键：st.rerun() 不能在 try-except 中
+                st.rerun()
+            st.divider()
         
         # TTS服务选择
         st.markdown("### 🎤 TTS设置")
@@ -622,7 +1016,7 @@ def main():
         # 更新session_state中的配置
         if 'config' in st.session_state:
             st.session_state['config']['tts']['service'] = tts_service
-            logger.info(f"TTS服务已设置为: {tts_service}")
+            logger.debug(f"TTS服务已设置为: {tts_service}")
         
         # 保存语言选择和音色选择到session_state
         st.session_state['target_lang'] = target_language
@@ -673,7 +1067,7 @@ def main():
         handle_file_upload()
     else:
         # 其他所有阶段都委托给WorkflowManager
-        logger.info(f"🚀 处理阶段: {processing_stage}")
+        logger.debug(f"🚀 处理阶段: {processing_stage}")
         workflow_manager = WorkflowManager(config)
         
         # 获取当前会话数据
@@ -847,7 +1241,7 @@ def handle_project_management():
         
         elif action == 'load_project':
             # 加载现有工程（传统方式）
-            project_integration = get_project_integration()
+            project_integration = get_user_project_integration()
             project_id = st.session_state.get('selected_project_id')
             
             if project_id:
@@ -861,13 +1255,28 @@ def handle_project_management():
         
         elif action == 'load_project_stage':
             # 加载工程到指定阶段
-            project_integration = get_project_integration()
+            project_integration = get_user_project_integration()
             project_id = result.get('project_id') or st.session_state.get('selected_project_id')
             target_stage = result.get('target_stage')
             
             if project_id and target_stage:
                 session_data = get_session_data()
                 if project_integration.load_project_to_session(project_id, session_data):
+                    # 处理 'translating' 这个过渡状态：根据实际数据判断应该进入哪个阶段
+                    if target_stage == 'translating':
+                        if session_data.get('translated_segments'):
+                            # 已有翻译数据，进入音频确认
+                            target_stage = 'user_confirmation'
+                            logger.info("自动从 translating 跳转到 user_confirmation（已有翻译数据）")
+                        elif session_data.get('confirmed_segments'):
+                            # 有确认分段但没翻译，重新进入语言选择
+                            target_stage = 'language_selection'
+                            logger.info("自动从 translating 跳转到 language_selection（需要重新翻译）")
+                        else:
+                            # 没有必要数据，回到项目主页
+                            target_stage = 'project_home'
+                            logger.warning("translating 状态但缺少必要数据，回到项目主页")
+                    
                     # 覆盖工程的processing_stage为用户选择的阶段
                     session_data['processing_stage'] = target_stage
                     update_session_data(session_data)
@@ -909,7 +1318,7 @@ def handle_project_management():
             if st.session_state['action'] == 'load_project':
                 project_id = st.session_state.get('selected_project_id')
                 if project_id:
-                    project_integration = get_project_integration()
+                    project_integration = get_user_project_integration()
                     session_data = get_session_data()
                     if project_integration.load_project_to_session(project_id, session_data):
                         update_session_data(session_data)
@@ -947,7 +1356,7 @@ def handle_file_upload():
     # 文件上传区域
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     uploaded_file = st.file_uploader(
-        "",
+        "上传SRT字幕文件",  # 非空 label（隐藏显示但用于可访问性）
         type=['srt'],
         help="支持标准SRT格式，包含中文字幕和时间码",
         label_visibility="collapsed"
@@ -1080,7 +1489,7 @@ def handle_file_upload():
                             file_content = f.read()
                         
                         # 创建工程
-                        project_integration = get_project_integration()
+                        project_integration = get_user_project_integration()
                         filename = original_filename  # 使用原始文件名
                         
                         # 获取用户输入
@@ -1096,7 +1505,7 @@ def handle_file_upload():
                             project.add_tags(["文件上传", "新创建"])
                             
                             # 保存工程
-                            project_manager = get_project_integration().project_manager
+                            project_manager = get_user_project_integration().project_manager
                             if project_manager.save_project(project):
                                 st.session_state['current_project'] = project
                                 logger.info(f"创建工程成功: {project.name} (目标语言: {target_language})")

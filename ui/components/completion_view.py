@@ -28,7 +28,7 @@ class CompletionView:
         col1, col2 = st.columns([1, 1])
         with col1:
             st.markdown("#### 🎧 在线试听")
-            st.audio(completion_data['audio_data'], format='audio/wav')
+            st.audio(completion_data['audio_data'], format='audio/mpeg')
         
         with col2:
             st.markdown("#### 📥 下载文件")
@@ -37,17 +37,10 @@ class CompletionView:
             target_lang = completion_data['target_lang']
             
             st.download_button(
-                label="下载配音音频 (.wav)",
+                label="下载配音音频 (.mp3)",
                 data=completion_data['audio_data'],
-                file_name=f"{project_name}_{target_lang}.wav",
-                mime="audio/wav",
-                use_container_width=True
-            )
-            st.download_button(
-                label="下载翻译字幕 (.srt)",
-                data=completion_data['subtitle_data'],
-                file_name=f"{project_name}_{target_lang}.srt",
-                mime="text/plain",
+                file_name=f"{project_name}_{target_lang}.mp3",
+                mime="audio/mpeg",
                 use_container_width=True
             )
         

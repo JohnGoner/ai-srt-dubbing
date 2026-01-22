@@ -435,13 +435,13 @@ class ProjectManager:
                 
                 # 添加元数据
                 metadata = {
-                    "export_version": "2.0",  # 升级版本号
+                    "export_version": "2.1",  # 版本号升级（MP3 格式）
                     "export_time": datetime.now(timezone.utc).isoformat(),
                     "project_id": project.id,
                     "project_name": project.name,
                     "contains_audio_data": audio_count > 0,
                     "audio_file_count": audio_count,
-                    "audio_format": "wav",
+                    "audio_format": "mp3",
                     "note": f"包含{audio_count}个音频文件的完整工程导出"
                 }
                 zipf.writestr("metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2))
@@ -511,34 +511,22 @@ class ProjectManager:
                                 logger.warning(f"处理片段数据时出错: {e}")
                                 continue
                         
-                        # 如果有音频数据，转换为文件
+                        # 如果有音频数据，转换为文件（使用 MP3 格式节省空间）
                         if audio_segment and isinstance(audio_segment, AudioSegment):
                             try:
                                 # 创建唯一的音频文件名
                                 segment_id = clean_seg.get('id', f'segment_{audio_counter}')
-                                audio_filename = f"{segment_id}.wav"
+                                audio_filename = f"{segment_id}.mp3"
                                 
-                                # 将AudioSegment转换为WAV二进制数据
+                                # 将AudioSegment转换为 MP3 二进制数据
                                 audio_buffer = io.BytesIO()
                                 
-                                # Windows系统优化：使用更兼容的音频导出参数
-                                import platform
-                                from utils.windows_audio_utils import is_windows
-                                
-                                if is_windows():
-                                    # 在Windows下使用标准的WAV参数
-                                    audio_segment.export(
-                                        audio_buffer, 
-                                        format="wav",
-                                        parameters=[
-                                            "-acodec", "pcm_s16le",  # 16-bit PCM编码
-                                            "-ar", "44100",          # 44.1kHz采样率
-                                            "-ac", "1"               # 单声道
-                                        ]
-                                    )
-                                else:
-                                    # 非Windows系统使用原有逻辑
-                                    audio_segment.export(audio_buffer, format="wav")
+                                # 统一使用 MP3 格式，128kbps 比特率
+                                audio_segment.export(
+                                    audio_buffer, 
+                                    format="mp3",
+                                    bitrate="128k"
+                                )
                                 
                                 audio_data = audio_buffer.getvalue()
                                 
@@ -624,11 +612,11 @@ class ProjectManager:
                 project_json = zipf.read("project.json").decode('utf-8')
                 project_data = json.loads(project_json)
                 
-                # 读取音频文件（如果存在）
+                # 读取音频文件（如果存在，支持 MP3 和 WAV 格式）
                 audio_files = {}
                 audio_file_count = 0
                 for file_name in file_list:
-                    if file_name.startswith('audio/') and file_name.endswith('.wav'):
+                    if file_name.startswith('audio/') and (file_name.endswith('.mp3') or file_name.endswith('.wav')):
                         audio_filename = Path(file_name).name
                         audio_data = zipf.read(file_name)
                         audio_files[audio_filename] = audio_data
@@ -696,9 +684,14 @@ class ProjectManager:
                             
                             if audio_filename in audio_files:
                                 try:
-                                    # 从二进制数据重新创建AudioSegment对象
+                                    # 从二进制数据重新创建AudioSegment对象（支持 MP3 和 WAV）
                                     audio_buffer = BytesIO(audio_files[audio_filename])
-                                    audio_segment = AudioSegment.from_wav(audio_buffer)
+                                    
+                                    # 根据文件扩展名选择解码方式
+                                    if audio_filename.endswith('.mp3'):
+                                        audio_segment = AudioSegment.from_mp3(audio_buffer)
+                                    else:
+                                        audio_segment = AudioSegment.from_wav(audio_buffer)
                                     
                                     # 由于我们不能直接在字典中存储AudioSegment对象，
                                     # 我们只更新audio_path，实际的AudioSegment会在需要时重新加载

@@ -21,13 +21,26 @@ from ui.components.completion_view import CompletionView
 from utils.project_integration import get_project_integration
 
 
+def _get_current_user_id() -> str:
+    """获取当前用户 ID（从 session_state）"""
+    auth_username = st.session_state.get('auth_username')
+    if auth_username:
+        return auth_username
+    return 'default_user'
+
+
 class WorkflowManager:
     """工作流管理器 - 统一协调所有UI阶段"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.project_integration = get_project_integration()
         self._init_components()
+    
+    @property
+    def project_integration(self):
+        """动态获取当前用户的工程集成实例"""
+        user_id = _get_current_user_id()
+        return get_project_integration(user_id=user_id)
     
     def _init_components(self):
         """初始化所有UI组件"""
@@ -69,11 +82,20 @@ class WorkflowManager:
         
         try:
             result = renderer(session_data)
-            logger.debug(f"✅ 渲染器执行完成，返回状态: {result.get('processing_stage', 'unknown')}")
+            new_stage = result.get('processing_stage', 'unknown')
+            logger.debug(f"✅ 渲染器执行完成，返回状态: {new_stage}")
             logger.debug(f"📋 返回数据概览: segments={len(result.get('segments', []))}, segmented_segments={len(result.get('segmented_segments', []))}")
             
             # 自动保存工程进度
-            self._auto_save_project_progress(result)
+            # 对于 confirm_segmentation 和 user_confirmation 阶段，只在状态转换时才保存，避免频繁写入 Firebase
+            # 用户在这些界面的每个操作都不需要立即保存，只有关键操作（确认片段、完成等）时才保存
+            skip_auto_save_stages = ['confirm_segmentation', 'user_confirmation']
+            skip_auto_save = stage in skip_auto_save_stages and new_stage == stage
+            
+            if not skip_auto_save:
+                self._auto_save_project_progress(result)
+            else:
+                logger.debug(f"跳过自动保存: {stage} 阶段未发生状态转换")
             
             return result
         except Exception as e:
@@ -81,14 +103,135 @@ class WorkflowManager:
             st.error(f"❌ 渲染阶段 {stage} 时发生错误: {str(e)}")
             return session_data
     
+    def _restore_audio_from_storage(self, segments: List[SegmentDTO], project: ProjectDTO) -> int:
+        """
+        检查片段是否有云端音频可用（不实际下载，使用懒加载策略）
+        
+        改进策略：
+        - 不一次性下载所有音频（避免卡顿）
+        - 只标记哪些片段有云端音频可用
+        - 实际播放时使用 URL 流式播放
+        - 只有在用户需要修改/确认时才按需下载单个片段
+        
+        Args:
+            segments: 需要检查的片段列表
+            project: 项目对象（包含 audio_storage_paths）
+            
+        Returns:
+            有云端音频可用的片段数量
+        """
+        available_count = 0
+        
+        if not project or not hasattr(project, 'audio_storage_paths'):
+            return 0
+        
+        audio_paths = project.audio_storage_paths
+        if not audio_paths:
+            logger.debug("项目没有保存的音频路径")
+            return 0
+        
+        logger.debug(f"_restore_audio_from_storage: audio_paths keys = {list(audio_paths.keys())}")
+        
+        # 只检查并记录有多少片段有云端音频，不实际下载
+        for seg in segments:
+            if seg.audio_data is not None:
+                # 已有内存中的音频数据
+                available_count += 1
+                continue
+            
+            # 检查是否有云端路径
+            storage_path = audio_paths.get(seg.id) or audio_paths.get(f"{seg.id}_preview")
+            if storage_path:
+                # 标记该片段有云端音频可用（通过 audio_path 字段）
+                seg.audio_path = storage_path
+                available_count += 1
+                logger.debug(f"片段 {seg.id} 设置 audio_path = {storage_path}")
+        
+        if available_count > 0:
+            logger.debug(f"检测到 {available_count} 个片段有云端音频可用（使用 URL 流式播放）")
+        
+        return available_count
+    
+    def _download_single_segment_audio(self, segment: SegmentDTO, project: ProjectDTO) -> bool:
+        """
+        按需下载单个片段的音频数据（用于需要修改的场景）
+        
+        Args:
+            segment: 需要下载音频的片段
+            project: 项目对象
+            
+        Returns:
+            是否下载成功
+        """
+        if segment.audio_data is not None:
+            return True  # 已有音频数据
+        
+        if not project or not hasattr(project, 'audio_storage_paths'):
+            return False
+        
+        audio_paths = project.audio_storage_paths
+        storage_path = audio_paths.get(segment.id) or audio_paths.get(f"{segment.id}_preview")
+        
+        if not storage_path:
+            return False
+        
+        try:
+            from utils.firebase_storage import get_storage_manager
+            from pydub import AudioSegment
+            from io import BytesIO
+            
+            storage = get_storage_manager()
+            if not storage or not storage.is_connected:
+                logger.debug(f"Firebase Storage 未连接，无法下载片段 {segment.id}")
+                return False
+            
+            # 🔥 兼容性处理：检查路径格式并转换
+            actual_path = storage_path
+            if '/audio/segments/' in storage_path:
+                import re
+                match = re.match(r'(.*/audio)/segments/([^/]+)/(preview|confirmed)\.mp3', storage_path)
+                if match:
+                    base_path = match.group(1)
+                    segment_id = match.group(2)
+                    stage = match.group(3)
+                    new_path = f"{base_path}/{stage}/{segment_id}.mp3"
+                    # 检查新路径是否存在
+                    if storage.check_file_exists(new_path):
+                        actual_path = new_path
+                        logger.debug(f"路径兼容转换: {storage_path} -> {new_path}")
+            
+            # 下载音频数据
+            audio_bytes = storage.download_audio(actual_path)
+            if audio_bytes:
+                audio_buffer = BytesIO(audio_bytes)
+                if storage_path.endswith('.mp3'):
+                    audio_segment = AudioSegment.from_mp3(audio_buffer)
+                else:
+                    audio_segment = AudioSegment.from_wav(audio_buffer)
+                
+                segment.set_audio_data(audio_segment)
+                logger.info(f"按需下载片段 {segment.id} 音频成功")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"按需下载片段 {segment.id} 音频失败: {e}")
+            return False
+    
     def _generate_audio_for_segments(self, segments: List[SegmentDTO], target_language: str) -> List[SegmentDTO]:
-        """为翻译段生成音频（使用TTS并发功能）"""
+        """为翻译段生成音频并进行智能迭代优化（并发版本，使用公共迭代优化器）"""
         try:
             from tts import create_tts_engine
+            from translation.text_optimizer import TextOptimizer
+            from utils.audio_iteration_optimizer import AudioIterationOptimizer
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import threading
             
             # 获取用户选择的TTS服务
             selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
             selected_voice_id = st.session_state.get('selected_voice_id')
+            config = st.session_state.get('config', self.config)
             
             # 检查TTS实例是否需要重新创建（服务类型变更）
             tts_engine = st.session_state.get('tts_instance')
@@ -96,7 +239,7 @@ class WorkflowManager:
             
             if not tts_engine or current_service != selected_tts_service:
                 logger.info(f"创建TTS引擎: {selected_tts_service}")
-                tts_engine = create_tts_engine(self.config, selected_tts_service)
+                tts_engine = create_tts_engine(config, selected_tts_service)
                 st.session_state['tts_instance'] = tts_engine
                 st.session_state['current_tts_service'] = selected_tts_service
             
@@ -105,74 +248,324 @@ class WorkflowManager:
                 tts_engine.set_voice(selected_voice_id)
                 logger.info(f"{selected_tts_service}设置音色: {selected_voice_id}")
             
-            logger.info(f"开始并发生成 {len(segments)} 个音频片段")
+            # 获取音色名称
+            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                voice_name = selected_voice_id
+            else:
+                voice_name = tts_engine.voice_map.get(target_language) if hasattr(tts_engine, 'voice_map') else None
+                if isinstance(voice_name, dict):
+                    voice_name = list(voice_name.keys())[0] if voice_name else None
             
-            # 准备TTS需要的数据格式
-            segments_for_tts = []
-            valid_segments = []
+            if not voice_name:
+                logger.warning(f"未配置语言 {target_language} 的音色，回退到简单生成模式")
+                return self._generate_audio_simple(segments, target_language, tts_engine)
             
-            for seg in segments:
-                if seg.final_text:
-                    # 转换为TTS需要的格式
-                    tts_segment = {
-                        'id': seg.id,
-                        'start': seg.start,
-                        'end': seg.end,
-                        'original_text': seg.original_text,
-                        'translated_text': seg.final_text,  # TTS使用final_text
-                        'duration': seg.target_duration
-                    }
-                    segments_for_tts.append(tts_segment)
-                    valid_segments.append(seg)
+            # 创建文本优化器
+            text_optimizer = TextOptimizer(config)
             
-            if not segments_for_tts:
-                logger.warning("没有有效的文本片段需要生成音频")
-                return segments
+            # 检查TTS是否支持语速调整（ElevenLabs不支持）
+            supports_speech_rate = selected_tts_service != 'elevenlabs'
             
-            # 显示进度提示
-            with st.spinner(f"正在并发生成 {len(segments_for_tts)} 个音频片段..."):
-                # 使用TTS的并发方法
-                audio_segments = tts_engine.generate_audio_segments(segments_for_tts, target_language)
+            # 并发配置
+            max_workers = min(5, len(segments))  # 最多5个并发worker
             
-            # 将音频数据更新回SegmentDTO
-            audio_map = {seg['id']: seg for seg in audio_segments}
+            logger.info(f"开始并发生成 {len(segments)} 个片段的音频 (workers={max_workers}, 语速调整: {'支持' if supports_speech_rate else '不支持'})")
             
-            for seg in valid_segments:
-                if seg.id in audio_map:
-                    audio_seg = audio_map[seg.id]
-                    
-                    # 设置音频数据
-                    if audio_seg.get('audio_data'):
-                        seg.set_audio_data(audio_seg['audio_data'])
+            # 进度显示
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # 线程安全的进度计数器
+            completed_count = [0]  # 使用列表以便在闭包中修改
+            progress_lock = threading.Lock()
+            
+            def process_segment(seg_idx: int, seg: SegmentDTO) -> tuple:
+                """处理单个片段的迭代优化（线程安全）"""
+                # 每个线程创建自己的迭代优化器实例
+                thread_optimizer = AudioIterationOptimizer(
+                    tts_engine=tts_engine,
+                    text_optimizer=text_optimizer,
+                    supports_speech_rate=supports_speech_rate
+                )
+                
+                if not seg.final_text:
+                    logger.warning(f"片段 {seg.id} 没有文本，跳过")
+                    return seg_idx, None
+                
+                # 获取片段的当前参数
+                current_text = seg.final_text
+                original_text = seg.original_text or seg.translated_text or current_text
+                target_duration = seg.target_duration
+                initial_rate = seg.speech_rate or 1.0 if supports_speech_rate else 1.0
+                
+                # 如果目标时长太短，跳过迭代优化
+                if target_duration < 0.5:
+                    logger.warning(f"片段 {seg.id} 目标时长 {target_duration:.2f}s 太短，跳过迭代优化")
+                    try:
+                        audio_data = tts_engine._generate_single_audio(current_text, voice_name, initial_rate, target_duration)
+                        return seg_idx, {
+                            'success': True,
+                            'audio_data': audio_data,
+                            'text': current_text,
+                            'speech_rate': initial_rate,
+                            'error_ms': 0,
+                            'error_percentage': 0,
+                            'quality': 'good',
+                            'is_valid': True
+                        }
+                    except Exception as e:
+                        logger.error(f"片段 {seg.id} 音频生成失败: {e}")
+                        return seg_idx, {'success': False, 'quality': 'error'}
+                
+                # 使用迭代优化器进行优化
+                result = thread_optimizer.optimize_segment(
+                    text=current_text,
+                    original_text=original_text,
+                    voice_name=voice_name,
+                    target_duration=target_duration,
+                    target_language=target_language,
+                    initial_speech_rate=initial_rate,
+                    source_language='zh'
+                )
+                
+                return seg_idx, result
+            
+            # 使用线程池并发处理
+            results_map = {}
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_idx = {
+                    executor.submit(process_segment, idx, seg): idx 
+                    for idx, seg in enumerate(segments)
+                }
+                
+                # 收集结果
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        seg_idx, result = future.result()
+                        results_map[seg_idx] = result
                         
-                        # 计算时长误差和质量评级
-                        if seg.target_duration > 0:
-                            error_ms = abs(seg.actual_duration - seg.target_duration) * 1000
-                            seg.timing_error_ms = error_ms
+                        # 更新进度（线程安全）
+                        with progress_lock:
+                            completed_count[0] += 1
+                            progress = completed_count[0] / len(segments)
+                            progress_bar.progress(progress)
+                            status_text.text(f"🔄 并发优化中: {completed_count[0]}/{len(segments)}")
                             
-                            # 设置质量评级
-                            error_percent = error_ms / (seg.target_duration * 1000) * 100
-                            if error_percent <= 5:
-                                seg.quality = 'excellent'
-                            elif error_percent <= 15:
-                                seg.quality = 'good'
-                            elif error_percent <= 30:
-                                seg.quality = 'fair'
-                            else:
-                                seg.quality = 'poor'
-                        else:
-                            seg.quality = 'good'  # 默认质量
-                    else:
-                        logger.warning(f"片段 {seg.id} 音频生成失败")
-                        seg.quality = 'error'
+                    except Exception as e:
+                        logger.error(f"处理片段 {idx} 时发生异常: {e}")
+                        results_map[idx] = {'success': False, 'quality': 'error'}
             
-            logger.info(f"✅ 并发生成 {len(segments)} 个片段音频完成")
+            # 应用结果到segments
+            for idx, seg in enumerate(segments):
+                result = results_map.get(idx)
+                if not result:
+                    continue
+                
+                if result.get('success') and result.get('best_result'):
+                    best = result['best_result']
+                    seg.set_audio_data(best.audio_data)
+                    seg.speech_rate = best.speech_rate
+                    seg.update_final_text(best.text)
+                    seg.timing_error_ms = abs(best.error_ms)
+                    
+                    # 设置质量评级
+                    if best.is_valid:
+                        seg.quality = 'excellent'
+                    elif best.error_percentage <= 10:
+                        seg.quality = 'good'
+                    elif best.error_percentage <= 20:
+                        seg.quality = 'fair'
+                    else:
+                        seg.quality = 'poor'
+                    
+                    logger.info(f"片段 {seg.id} 优化完成: 质量={seg.quality}, 误差={best.error_ms:.0f}ms")
+                    
+                elif result.get('success') and result.get('audio_data'):
+                    # 短片段的简单处理结果
+                    seg.set_audio_data(result['audio_data'])
+                    seg.speech_rate = result.get('speech_rate', 1.0)
+                    seg.quality = result.get('quality', 'good')
+                else:
+                    logger.warning(f"片段 {seg.id} 没有生成有效的音频")
+                    seg.quality = 'error'
+            
+            progress_bar.progress(1.0)
+            status_text.text(f"✅ 并发优化完成！共处理 {len(segments)} 个片段")
+            
+            # 统计优化结果
+            quality_stats = {'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0, 'error': 0}
+            for seg in segments:
+                quality = getattr(seg, 'quality', 'unknown')
+                if quality in quality_stats:
+                    quality_stats[quality] += 1
+            
+            logger.info(f"✅ 并发迭代优化完成: {quality_stats}")
+            
+            # 🔥 Stage 1: 上传预览音频到 Firebase Storage
+            self._upload_preview_audios(segments)
+            
+            # 清理进度显示
+            progress_bar.empty()
+            status_text.empty()
+            
             return segments
             
         except Exception as e:
-            logger.error(f"❌ 并发生成音频失败: {e}")
-            st.error(f"❌ 并发生成音频失败: {str(e)}")
+            logger.error(f"❌ 并发迭代优化失败: {e}")
+            st.error(f"❌ 并发迭代优化失败: {str(e)}")
             return segments
+    
+    def _upload_preview_audios(self, segments: List[SegmentDTO]):
+        """
+        Stage 1: 异步上传预览音频到 Firebase Storage
+        
+        在用户点击"开始配音处理"后，迭代优化生成的音频作为预览版本异步上传
+        不阻塞主线程，提升用户体验
+        
+        Args:
+            segments: 包含音频数据的片段列表
+        """
+        try:
+            # 获取当前项目信息
+            current_project = st.session_state.get('current_project')
+            if not current_project:
+                logger.debug("无项目信息，跳过预览音频上传")
+                return
+            
+            # 检查是否使用 Firebase 存储后端
+            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
+                logger.debug("非 Firebase 存储后端，跳过预览音频上传")
+                return
+            
+            user_id = getattr(current_project, 'owner_id', '')
+            project_id = getattr(current_project, 'id', '')
+            
+            if not user_id or not project_id:
+                logger.warning("缺少用户 ID 或项目 ID，跳过预览音频上传")
+                return
+            
+            from utils.firebase_storage import get_storage_manager
+            from utils.async_upload_manager import get_upload_manager
+            
+            storage = get_storage_manager()
+            if not storage.is_connected:
+                logger.warning("Firebase Storage 未连接，跳过预览音频上传")
+                return
+            
+            total_with_audio = sum(1 for seg in segments if seg.audio_data is not None)
+            
+            if total_with_audio == 0:
+                logger.debug("没有需要上传的音频")
+                return
+            
+            logger.info(f"开始异步上传 Stage 1 预览音频: {total_with_audio} 个片段")
+            
+            # 使用异步上传管理器
+            upload_manager = get_upload_manager()
+            
+            # 定义上传完成回调，更新项目的音频存储路径
+            def on_upload_complete(task_id: str, result_path: str, error: str):
+                if error:
+                    logger.warning(f"预览音频上传失败 [{task_id}]: {error}")
+                    return
+                
+                if result_path:
+                    # 从 task_id 中无法直接获取 segment_id，回调中只记录日志
+                    logger.debug(f"预览音频上传完成 [{task_id}]: {result_path}")
+            
+            # 批量提交异步上传任务
+            for seg in segments:
+                if seg.audio_data is None:
+                    continue
+                
+                upload_manager.submit_preview_upload(
+                    user_id=user_id,
+                    project_id=project_id,
+                    segment_id=seg.id,
+                    audio_data=seg.audio_data,
+                    callback=on_upload_complete
+                )
+                
+                # 预先设置预览路径占位（异步上传完成后会更新）
+                # 路径格式: users/{user_id}/projects/{project_id}/audio/preview/{segment_id}.mp3
+                preview_key = f"{seg.id}_preview"
+                expected_path = f"users/{user_id}/projects/{project_id}/audio/preview/{seg.id}.mp3"
+                current_project.update_audio_storage_path(preview_key, expected_path)
+            
+            logger.info(f"已提交 {total_with_audio} 个预览音频到异步上传队列")
+            
+            # 保存 TTS 配置
+            selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+            selected_voice_id = st.session_state.get('selected_voice_id', '')
+            current_project.set_tts_config(selected_tts_service, selected_voice_id)
+            
+            # 🔥 重要：立即保存项目以持久化 audio_storage_paths
+            try:
+                self.project_integration.save_project_state(current_project, st.session_state)
+                logger.info(f"已保存项目音频路径映射: {len(current_project.audio_storage_paths)} 条")
+            except Exception as save_err:
+                logger.warning(f"保存音频路径映射时出错: {save_err}")
+            
+        except Exception as e:
+            logger.error(f"提交预览音频上传任务失败: {e}")
+    
+    def _generate_audio_simple(self, segments: List[SegmentDTO], target_language: str, tts_engine) -> List[SegmentDTO]:
+        """简单音频生成（无迭代优化，作为回退方案）"""
+        logger.info(f"使用简单模式生成 {len(segments)} 个音频片段")
+        
+        # 准备TTS需要的数据格式
+        segments_for_tts = []
+        valid_segments = []
+        
+        for seg in segments:
+            if seg.final_text:
+                tts_segment = {
+                    'id': seg.id,
+                    'start': seg.start,
+                    'end': seg.end,
+                    'original_text': seg.original_text,
+                    'translated_text': seg.final_text,
+                    'duration': seg.target_duration
+                }
+                segments_for_tts.append(tts_segment)
+                valid_segments.append(seg)
+        
+        if not segments_for_tts:
+            logger.warning("没有有效的文本片段需要生成音频")
+            return segments
+        
+        with st.spinner(f"正在生成 {len(segments_for_tts)} 个音频片段..."):
+            audio_segments = tts_engine.generate_audio_segments(segments_for_tts, target_language)
+        
+        audio_map = {seg['id']: seg for seg in audio_segments}
+        
+        for seg in valid_segments:
+            if seg.id in audio_map:
+                audio_seg = audio_map[seg.id]
+                if audio_seg.get('audio_data'):
+                    seg.set_audio_data(audio_seg['audio_data'])
+                    if seg.target_duration > 0:
+                        error_ms = abs(seg.actual_duration - seg.target_duration) * 1000
+                        seg.timing_error_ms = error_ms
+                        error_percent = error_ms / (seg.target_duration * 1000) * 100
+                        if error_percent <= 5:
+                            seg.quality = 'excellent'
+                        elif error_percent <= 15:
+                            seg.quality = 'good'
+                        elif error_percent <= 30:
+                            seg.quality = 'fair'
+                        else:
+                            seg.quality = 'poor'
+                    else:
+                        seg.quality = 'good'
+                else:
+                    seg.quality = 'error'
+        
+        logger.info(f"✅ 简单模式生成 {len(segments)} 个片段音频完成")
+        return segments
     
     
     def _render_segmentation_analysis(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -524,6 +917,17 @@ class WorkflowManager:
                 session_data['translator_instance'] = translator
                 session_data['translated_segments'] = translated_dto_segments
                 
+                # 🔥 关键修复：设置工程的翻译服务信息
+                current_project = session_data.get('current_project')
+                if current_project and isinstance(current_project, ProjectDTO):
+                    # 获取实际使用的翻译服务名称
+                    actual_translation_service = translation_config.get('service', 'google')
+                    current_project.set_translation_config(
+                        target_lang=target_language,
+                        service=actual_translation_service
+                    )
+                    logger.info(f"工程翻译服务已设置为: {actual_translation_service}")
+                
                 progress_bar.progress(100)
                 status_text.text("✅ 翻译完成！")
                 
@@ -685,21 +1089,43 @@ class WorkflowManager:
         translated_original_segments = session_data.get('translated_original_segments', [])
         target_lang = session_data.get('target_lang', 'en')
         
+        # 🔥 检查云端音频可用性（懒加载策略，不实际下载）
+        current_project = session_data.get('current_project')
+        has_cloud_audio = False
+        if current_project and hasattr(current_project, 'audio_storage_paths') and current_project.audio_storage_paths:
+            # 检查 translated_segments 的云端音频
+            if translated_segments and not any(seg.audio_data for seg in translated_segments):
+                available_count = self._restore_audio_from_storage(translated_segments, current_project)
+                if available_count > 0:
+                    has_cloud_audio = True
+            
+            # 检查 confirmation_segments 的云端音频
+            if confirmation_segments and not any(seg.audio_data for seg in confirmation_segments):
+                available_count = self._restore_audio_from_storage(confirmation_segments, current_project)
+                if available_count > 0:
+                    has_cloud_audio = True
+        
         # 如果有翻译数据但没有优化数据，直接使用翻译数据
         if translated_segments and not optimized_segments:
-            logger.info("使用直接翻译数据进行音频确认")
+            logger.debug("使用直接翻译数据进行音频确认")
             
-            # 为翻译段生成音频（如果还没有的话）
-            if not any(seg.audio_data for seg in translated_segments):
+            # 🔥 改进：只有在没有云端音频且没有内存音频时才生成新音频
+            has_memory_audio = any(seg.audio_data for seg in translated_segments)
+            has_audio_path = any(seg.audio_path for seg in translated_segments)
+            
+            if not has_memory_audio and not has_audio_path and not has_cloud_audio:
                 logger.info("开始为翻译段生成音频...")
                 translated_segments = self._generate_audio_for_segments(translated_segments, target_lang)
                 # 确保TTS实例在session_data中也保存
                 if 'tts_instance' in st.session_state:
                     session_data['tts_instance'] = st.session_state['tts_instance']
+            elif has_cloud_audio or has_audio_path:
+                logger.debug("检测到云端音频可用，跳过重新生成")
             
             # 记录音频数据状态
             audio_count = sum(1 for seg in translated_segments if seg.audio_data is not None)
-            logger.info(f"翻译段音频状态检查：共{len(translated_segments)}个段，{audio_count}个有音频数据")
+            path_count = sum(1 for seg in translated_segments if seg.audio_path)
+            logger.debug(f"翻译段音频状态：共{len(translated_segments)}个段，{audio_count}个有内存音频，{path_count}个有云端路径")
             
             # 使用翻译段作为确认段（深度复制以确保数据完整性）
             optimized_segments = translated_segments
@@ -707,12 +1133,15 @@ class WorkflowManager:
             for seg in translated_segments:
                 # 创建新的SegmentDTO实例确保数据完整性
                 new_seg = SegmentDTO.from_legacy_segment(seg.to_legacy_dict())
-                # 重要：确保音频数据正确复制
+                # 重要：确保音频数据和路径正确复制
                 if seg.audio_data is not None:
                     new_seg.set_audio_data(seg.audio_data)
                     logger.debug(f"片段 {seg.id} 音频数据已复制到确认段")
+                elif seg.audio_path:
+                    new_seg.audio_path = seg.audio_path
+                    logger.debug(f"片段 {seg.id} 云端音频路径已复制到确认段")
                 else:
-                    logger.warning(f"片段 {seg.id} 缺少音频数据")
+                    logger.warning(f"片段 {seg.id} 缺少音频数据和云端路径")
                 confirmation_segments.append(new_seg)
             
             # 生成原始片段的翻译版本
@@ -725,57 +1154,63 @@ class WorkflowManager:
             session_data['confirmation_segments'] = confirmation_segments
             session_data['translated_original_segments'] = translated_original_segments
         
-        # 验证必要数据（改进验证逻辑，避免意外的状态回退）
-        missing_data = []
-        if not optimized_segments:
-            missing_data.append("优化片段")
-        if not confirmation_segments:
-            missing_data.append("确认片段")
-        if not translated_original_segments:
-            missing_data.append("翻译原始片段")
-        
-        if missing_data:
-            logger.warning(f"音频确认阶段缺少数据: {', '.join(missing_data)}")
-            st.warning(f"⚠️ 缺少以下数据: {', '.join(missing_data)}")
+        # 尝试从翻译数据重建缺少的派生数据（这是正常流程，不需要警告用户）
+        if translated_segments:
+            rebuilt_items = []
             
-            # 如果有翻译数据，尝试重新构建缺少的数据
-            if translated_segments:
-                logger.info("尝试从翻译数据重新构建缺少的数据...")
-                
-                if not optimized_segments:
-                    optimized_segments = translated_segments
-                    session_data['optimized_segments'] = optimized_segments
-                    logger.info("已从翻译数据重建优化片段")
-                
-                if not confirmation_segments:
-                    confirmation_segments = []
-                    for seg in translated_segments:
-                        new_seg = SegmentDTO.from_legacy_segment(seg.to_legacy_dict())
-                        if seg.audio_data is not None:
-                            new_seg.set_audio_data(seg.audio_data)
-                        confirmation_segments.append(new_seg)
-                    session_data['confirmation_segments'] = confirmation_segments
-                    logger.info("已从翻译数据重建确认片段")
-                
-                if not translated_original_segments:
-                    translated_original_segments = self._redistribute_translations(
-                        translated_segments, session_data.get('segments', [])
-                    )
-                    session_data['translated_original_segments'] = translated_original_segments
-                    logger.info("已重建翻译原始片段")
-            else:
-                # 如果连翻译数据都没有，才回退到语言选择
-                st.error("❌ 关键翻译数据丢失，需要重新处理")
-                session_data['processing_stage'] = 'language_selection'
-                return session_data
+            if not optimized_segments:
+                optimized_segments = translated_segments
+                session_data['optimized_segments'] = optimized_segments
+                rebuilt_items.append("优化片段")
+            
+            if not confirmation_segments:
+                confirmation_segments = []
+                for seg in translated_segments:
+                    new_seg = SegmentDTO.from_legacy_segment(seg.to_legacy_dict())
+                    if seg.audio_data is not None:
+                        new_seg.set_audio_data(seg.audio_data)
+                    elif seg.audio_path:
+                        new_seg.audio_path = seg.audio_path
+                    confirmation_segments.append(new_seg)
+                session_data['confirmation_segments'] = confirmation_segments
+                rebuilt_items.append("确认片段")
+            
+            if not translated_original_segments:
+                translated_original_segments = self._redistribute_translations(
+                    translated_segments, session_data.get('segments', [])
+                )
+                session_data['translated_original_segments'] = translated_original_segments
+                rebuilt_items.append("翻译原始片段")
+            
+            if rebuilt_items:
+                logger.info(f"从翻译数据重建派生数据: {', '.join(rebuilt_items)}")
         
-        # 验证音频数据完整性
-        audio_missing_count = sum(1 for seg in confirmation_segments if seg.audio_data is None)
+        # 验证必要数据（仅在重建后仍然缺少关键数据时才提示）
+        missing_critical_data = []
+        if not optimized_segments:
+            missing_critical_data.append("优化片段")
+        if not confirmation_segments:
+            missing_critical_data.append("确认片段")
+        
+        if missing_critical_data:
+            # 真正缺少关键数据才需要回退
+            logger.error(f"音频确认阶段缺少关键数据: {', '.join(missing_critical_data)}")
+            st.error("❌ 关键翻译数据丢失，需要重新处理")
+            session_data['processing_stage'] = 'language_selection'
+            return session_data
+        
+        # 验证音频数据完整性（同时检查内存音频和云端路径）
+        def has_audio_available(seg):
+            """检查片段是否有可用音频（内存或云端）"""
+            return seg.audio_data is not None or (seg.audio_path and len(seg.audio_path) > 0)
+        
+        audio_missing_count = sum(1 for seg in confirmation_segments if not has_audio_available(seg))
+        audio_memory_count = sum(1 for seg in confirmation_segments if seg.audio_data is not None)
+        audio_cloud_count = sum(1 for seg in confirmation_segments if seg.audio_path and seg.audio_data is None)
+        
         if audio_missing_count > 0:
-            logger.warning(f"警告：{audio_missing_count}/{len(confirmation_segments)} 个确认片段缺少音频数据")
+            logger.warning(f"警告：{audio_missing_count}/{len(confirmation_segments)} 个确认片段完全缺少音频")
             st.warning(f"⚠️ 发现 {audio_missing_count} 个片段缺少音频数据，系统将在确认时自动生成")
-        else:
-            logger.info(f"✅ 所有 {len(confirmation_segments)} 个确认片段都有音频数据")
         
         # 使用音频确认组件
         result = self.audio_confirmation_view.render(
@@ -894,19 +1329,44 @@ class WorkflowManager:
                 tts.set_voice(selected_voice_id)
             
             target_lang = session_data.get('target_lang', 'en')
+            current_project = session_data.get('current_project')
             
-            # 在转换前验证确认片段的音频数据
+            # 🔥 重要：在合并前下载缺失的云端音频
+            # 检查已确认但只有云端路径没有内存数据的片段
+            segments_need_download = [
+                seg for seg in confirmed_segments 
+                if seg.confirmed and seg.audio_data is None and seg.audio_path
+            ]
+            
+            if segments_need_download and current_project:
+                logger.info(f"发现 {len(segments_need_download)} 个已确认片段需要从云端下载音频")
+                download_progress = st.progress(0, text="正在下载云端音频...")
+                
+                for i, seg in enumerate(segments_need_download):
+                    download_progress.progress(
+                        (i + 1) / len(segments_need_download),
+                        text=f"正在下载音频 {i + 1}/{len(segments_need_download)}..."
+                    )
+                    success = self._download_single_segment_audio(seg, current_project)
+                    if not success:
+                        logger.warning(f"片段 {seg.id} 音频下载失败")
+                
+                download_progress.empty()
+                logger.info("云端音频下载完成")
+            
+            # 验证确认片段的音频数据
             audio_available_count = sum(1 for seg in confirmed_segments if seg.audio_data is not None)
             confirmed_count = sum(1 for seg in confirmed_segments if seg.confirmed)
-            logger.info(f"最终音频生成前验证：{len(confirmed_segments)}个片段，{confirmed_count}个已确认，{audio_available_count}个有音频数据")
+            logger.info(f"最终音频生成验证：{len(confirmed_segments)}个片段，{confirmed_count}个已确认，{audio_available_count}个有音频数据")
             
             if audio_available_count == 0:
                 logger.error("❌ 所有确认片段都没有音频数据！")
-                st.error("❌ 无法生成最终音频：所有片段都缺少音频数据")
+                st.error("❌ 无法生成最终音频：所有片段都缺少音频数据，请确保至少有一个片段有音频")
                 return
             elif audio_available_count < confirmed_count:
-                logger.warning(f"⚠️ {confirmed_count - audio_available_count}个已确认片段缺少音频数据")
-                st.warning(f"⚠️ {confirmed_count - audio_available_count}个已确认片段缺少音频数据，将在最终音频中显示为静音")
+                missing_count = confirmed_count - audio_available_count
+                logger.warning(f"⚠️ {missing_count}个已确认片段缺少音频数据")
+                st.warning(f"⚠️ {missing_count}个已确认片段缺少音频数据，这些片段将在最终音频中显示为静音")
             
             # 转换为legacy格式
             legacy_segments = [seg.to_legacy_dict() for seg in confirmed_segments]
@@ -915,7 +1375,6 @@ class WorkflowManager:
             final_audio = audio_synthesizer.merge_confirmed_audio_segments(legacy_segments)
             
             # 获取工程名用于输出文件命名
-            current_project = session_data.get('current_project')
             project_name = getattr(current_project, 'name', None) if current_project else None
             
             # 如果没有工程名，使用默认名称
@@ -925,9 +1384,8 @@ class WorkflowManager:
             # 清理文件名中的非法字符
             safe_project_name = "".join(c if c.isalnum() or c in ('-', '_', ' ', '.') else '_' for c in project_name)
             
-            # 保存文件 - 使用工程名作为文件名
-            audio_output = f"{safe_project_name}_{target_lang}.wav"
-            subtitle_output = f"{safe_project_name}_{target_lang}.srt"
+            # 保存文件 - 使用工程名作为文件名（音频使用 MP3 格式节省空间）
+            audio_output = f"{safe_project_name}_{target_lang}.mp3"
             
             # Windows系统优化的音频导出
             import platform
@@ -944,8 +1402,8 @@ class WorkflowManager:
                 else:
                     raise Exception(f"Windows音频导出失败: {audio_output}")
             else:
-                # 非Windows系统使用原有逻辑
-                final_audio.export(audio_output, format="wav")
+                # 非Windows系统使用原有逻辑，导出为 MP3 格式
+                final_audio.export(audio_output, format="mp3", bitrate="128k")
                 logger.info(f"音频导出完成: {audio_output}")
                 
                 # 验证输出文件
@@ -953,46 +1411,15 @@ class WorkflowManager:
                 if not output_path.exists() or output_path.stat().st_size == 0:
                     raise Exception(f"最终音频文件创建失败或为空: {audio_output}")
             
-            # 保存字幕
-            from audio_processor.subtitle_processor import SubtitleProcessor
-            subtitle_processor = SubtitleProcessor(self.config)
-            
-            # 添加详细调试日志
-            logger.info(f"准备保存字幕，确认片段数量: {len(confirmed_segments)}")
-            
-            # 记录每个片段的详细信息
-            for i, seg in enumerate(confirmed_segments):
-                logger.info(f"最终片段 {i+1}/{len(confirmed_segments)}: "
-                           f"id={seg.id}, confirmed={seg.confirmed}, "
-                           f"user_modified={seg.user_modified}, "
-                           f"quality={seg.quality}, "
-                           f"timing_error_ms={seg.timing_error_ms}, "
-                           f"speech_rate={seg.speech_rate}, "
-                           f"actual_duration={seg.actual_duration}, "
-                           f"target_duration={seg.target_duration}")
-                logger.debug(f"  final_text='{seg.final_text[:100]}...'")
-                logger.debug(f"  optimized_text='{(seg.optimized_text or '')[:100]}...'")
-                logger.debug(f"  has_audio_data={seg.audio_data is not None}")
-            
-            # 使用confirmed_segments，这些是用户确认过的片段
-            confirmed_legacy = [seg.to_legacy_dict() for seg in confirmed_segments]
-            
-            # 确保所有片段都有final_text
-            for seg in confirmed_legacy:
-                if not seg.get('final_text'):
-                    seg['final_text'] = (
-                        seg.get('optimized_text') or 
-                        seg.get('translated_text') or 
-                        seg.get('original_text', '')
-                    )
-            
-            subtitle_processor.save_subtitle(confirmed_legacy, subtitle_output, 'srt')
-            
             # 保存结果到session
             with open(audio_output, 'rb') as f:
                 audio_data = f.read()
-            with open(subtitle_output, 'rb') as f:
-                subtitle_data = f.read()
+            
+            # 🔥 上传到 Firebase Storage（如果启用）
+            storage_upload_results = self._upload_to_firebase_storage(
+                current_project, confirmed_segments, audio_data,
+                audio_output, selected_tts_service, selected_voice_id
+            )
             
             # 计算统计信息
             optimized_segments = session_data.get('optimized_segments', [])
@@ -1022,7 +1449,6 @@ class WorkflowManager:
             
             session_data['completion_results'] = {
                 'audio_data': audio_data,
-                'subtitle_data': subtitle_data,
                 'target_lang': target_lang,
                 'project_name': safe_project_name,  # 工程名用于下载文件命名
                 'optimized_segments': [seg.to_legacy_dict() for seg in confirmed_segments],  # 使用用户确认后的segments
@@ -1038,6 +1464,137 @@ class WorkflowManager:
         except Exception as e:
             st.error(f"❌ 生成最终音频时发生错误: {str(e)}")
             logger.error(f"生成最终音频失败: {e}")
+    
+    def _upload_to_firebase_storage(
+        self, 
+        project: Optional['ProjectDTO'], 
+        confirmed_segments: List[SegmentDTO],
+        audio_data: bytes,
+        audio_filename: str,
+        tts_service: str,
+        tts_voice_id: str
+    ) -> Dict[str, Any]:
+        """
+        异步上传最终合成音频到 Firebase Storage（可选，优先级低）
+        
+        注意：片段音频已在 Stage 1/Stage 2 阶段上传，这里只上传最终合成的音频
+        不阻塞主线程，提升用户体验
+        
+        Args:
+            project: 当前项目
+            confirmed_segments: 确认的片段列表
+            audio_data: 最终合成音频数据
+            audio_filename: 音频文件名
+            tts_service: 使用的 TTS 服务
+            tts_voice_id: 使用的音色 ID
+            
+        Returns:
+            上传结果字典
+        """
+        results = {
+            'uploaded': False,
+            'final_audio_path': None,
+            'error': None
+        }
+        
+        if not project:
+            logger.debug("无项目信息，跳过 Firebase Storage 上传")
+            return results
+        
+        # 检查是否使用 Firebase 存储后端
+        if project.storage_backend != "firebase":
+            logger.debug(f"项目使用 {project.storage_backend} 存储后端，跳过 Firebase Storage 上传")
+            return results
+        
+        try:
+            from utils.firebase_storage import get_storage_manager
+            from utils.async_upload_manager import get_upload_manager
+            
+            storage = get_storage_manager()
+            if not storage.is_connected:
+                logger.warning("Firebase Storage 未连接，跳过上传")
+                return results
+            
+            user_id = project.owner_id
+            project_id = project.id
+            
+            if not user_id or not project_id:
+                logger.warning("缺少用户 ID 或项目 ID，跳过 Firebase Storage 上传")
+                return results
+            
+            logger.info(f"开始异步上传最终合成文件到 Firebase Storage: 用户={user_id}, 项目={project_id}")
+            
+            # 使用异步上传管理器
+            upload_manager = get_upload_manager()
+            
+            # 1. 异步上传最终音频文件
+            expected_audio_path = f"users/{user_id}/projects/{project_id}/output/{audio_filename}"
+            
+            def on_audio_complete(task_id: str, result_path: str, error: str):
+                if error:
+                    logger.warning(f"最终音频上传失败: {error}")
+                else:
+                    logger.info(f"最终音频上传成功: {result_path}")
+            
+            upload_manager.submit_final_audio_upload(
+                user_id=user_id,
+                project_id=project_id,
+                filename=audio_filename,
+                audio_data=audio_data,
+                callback=on_audio_complete
+            )
+            
+            # 预先设置路径
+            project.set_final_output_paths(audio_path=expected_audio_path)
+            results['final_audio_path'] = expected_audio_path
+            
+            # 注意：片段音频已在 Stage 1 (预览) 和 Stage 2 (确认) 阶段上传
+            # 这里不再重复上传片段音频
+            
+            # 2. 保存 TTS 配置到项目
+            if tts_service:
+                project.set_tts_config(tts_service, tts_voice_id or "")
+                logger.info(f"TTS 配置已保存: {tts_service}, voice={tts_voice_id}")
+            
+            # 3. 记录用户活动日志
+            self._log_user_activity(
+                user_id, project_id, 
+                'completion',
+                f"项目完成: {len(confirmed_segments)} 个片段, TTS={tts_service}"
+            )
+            
+            results['uploaded'] = True
+            logger.info("最终合成文件已提交到异步上传队列")
+            
+        except Exception as e:
+            results['error'] = str(e)
+            logger.error(f"提交最终文件上传任务失败: {e}")
+        
+        return results
+    
+    def _log_user_activity(self, user_id: str, project_id: str, action: str, details: str = ""):
+        """
+        记录用户活动日志到 Firebase
+        
+        Args:
+            user_id: 用户 ID
+            project_id: 项目 ID
+            action: 操作类型
+            details: 详细信息
+        """
+        try:
+            from utils.firebase_activity_logger import get_activity_logger
+            
+            activity_logger = get_activity_logger()
+            activity_logger.log_activity(
+                user_id=user_id,
+                activity_type=action,
+                project_id=project_id,
+                details={'message': details} if details else None
+            )
+            
+        except Exception as e:
+            logger.warning(f"记录用户活动日志失败: {e}")
     
     def _reset_all_states(self, session_data: Dict[str, Any]):
         """重置所有状态（修复版本 - 不破坏已完成的工程）"""

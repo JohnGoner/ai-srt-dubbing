@@ -118,7 +118,7 @@ class MinimaxTTS:
             voice_id: 音色ID
         """
         self.current_voice_id = voice_id
-        logger.info(f"已设置MiniMax音色: {voice_id}")
+        logger.debug(f"已设置MiniMax音色: {voice_id}")
     
     def get_voice_id(self, language: str) -> str:
         """
@@ -993,8 +993,8 @@ class MinimaxTTS:
         else:
             audio_segment = self._generate_single_audio(text, voice_id, speech_rate)
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", prefix=file_prefix + "_") as f:
-            audio_segment.export(f.name, format="wav")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", prefix=file_prefix + "_") as f:
+            audio_segment.export(f.name, format="mp3", bitrate="128k")
             file_path = f.name
         return file_path
     
@@ -1082,7 +1082,13 @@ class MinimaxTTS:
         """
         try:
             from pydub import AudioSegment
-            audio = AudioSegment.from_wav(audio_file_path)
+            # 根据文件扩展名自动选择格式
+            if audio_file_path.endswith('.mp3'):
+                audio = AudioSegment.from_mp3(audio_file_path)
+            elif audio_file_path.endswith('.wav'):
+                audio = AudioSegment.from_wav(audio_file_path)
+            else:
+                audio = AudioSegment.from_file(audio_file_path)
             duration_seconds = len(audio) / 1000.0
             return duration_seconds
         except Exception as e:

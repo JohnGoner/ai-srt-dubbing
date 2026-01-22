@@ -39,7 +39,7 @@ class AudioConfirmationView:
         # 确保segments按正确顺序排序（按start时间排序）
         if confirmation_segments:
             confirmation_segments.sort(key=lambda seg: (seg.start, seg.id))
-            logger.info(f"已对 {len(confirmation_segments)} 个确认片段按时间排序")
+            logger.debug(f"已对 {len(confirmation_segments)} 个确认片段按时间排序")
         
         # 显示总体统计 (极简版)
         self._display_overall_stats_minimal(confirmation_segments)
@@ -127,23 +127,6 @@ class AudioConfirmationView:
         total_segments = len(confirmation_segments)
         if 'current_confirmation_index' not in st.session_state:
             st.session_state.current_confirmation_index = 0
-        
-        # 自动跳转到第一个未确认的片段
-        # 当当前片段已确认时，自动跳到下一个未确认片段
-        current_idx = st.session_state.current_confirmation_index
-        if current_idx < total_segments and confirmation_segments[current_idx].confirmed:
-            # 寻找第一个未确认的片段
-            first_unconfirmed_index = None
-            for i, seg in enumerate(confirmation_segments):
-                if not seg.confirmed:
-                    first_unconfirmed_index = i
-                    break
-            
-            # 如果找到未确认片段，跳转过去
-            if first_unconfirmed_index is not None:
-                st.session_state.current_confirmation_index = first_unconfirmed_index
-                logger.info(f"自动跳转到未确认片段: {first_unconfirmed_index + 1}/{total_segments}")
-                st.toast(f"🎯 自动跳转到第 {first_unconfirmed_index + 1} 个未确认片段")
 
         current_index = st.session_state.current_confirmation_index
 
@@ -267,8 +250,10 @@ class AudioConfirmationView:
             if new_text != current_segment.final_text:
                 current_segment.update_final_text(new_text)
             
-        # 语速控制组件
-        self._display_speech_rate_control(current_segment, current_index)
+        # 语速控制组件 - 仅对支持语速调整的TTS服务显示（ElevenLabs不支持）
+        selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+        if selected_tts_service != 'elevenlabs':
+            self._display_speech_rate_control(current_segment, current_index)
         
         # 音频预览
         self._display_audio_preview(current_segment, current_index)
@@ -277,11 +262,18 @@ class AudioConfirmationView:
         st.markdown("---")
         
         # 主操作：智能迭代优化
+        # ElevenLabs不支持语速调整，按钮提示文字做区分
+        selected_tts_for_button = st.session_state.get('selected_tts_service', 'minimax')
+        if selected_tts_for_button == 'elevenlabs':
+            optimize_help = "三轮迭代自动优化：生成→优化文本→选最优"
+        else:
+            optimize_help = "三轮迭代自动优化：生成→微调语速/优化文本→选最优"
+        
         if st.button(
             "🚀 智能迭代优化",
             key=f"smart_optimize_{current_index}",
             type="primary",
-            help="三轮迭代自动优化：生成→微调语速/优化文本→选最优",
+            help=optimize_help,
             use_container_width=True
         ):
             self._smart_iterative_optimization(current_segment, target_lang, current_index)
@@ -338,6 +330,8 @@ class AudioConfirmationView:
                             self._regenerate_segment_audio(current_segment, target_lang, current_index)
                             if current_segment.audio_data is not None:
                                 current_segment.confirmed = True
+                                # 🔥 Stage 2: 上传确认音频
+                                self._upload_confirmed_audio(current_segment)
                                 st.success("✅ 音频已生成并确认片段！")
                             else:
                                 st.error("❌ 音频生成失败，无法确认片段")
@@ -349,6 +343,8 @@ class AudioConfirmationView:
                     else:
                         # 音频数据存在，直接确认
                         current_segment.confirmed = True
+                        # 🔥 Stage 2: 上传确认音频
+                        self._upload_confirmed_audio(current_segment)
                         st.success("✅ 片段已确认！")
                     
                     # 智能跳转到下一个未确认的片段
@@ -456,6 +452,11 @@ class AudioConfirmationView:
         """显示音频预览"""
         st.markdown("### 🎵 音频预览")
         
+        # 调试：显示片段的音频状态
+        has_audio_data = segment.audio_data is not None
+        has_audio_path = bool(segment.audio_path)
+        logger.debug(f"_display_audio_preview: 片段 {segment.id}, audio_data={has_audio_data}, audio_path={has_audio_path}, path={segment.audio_path}")
+        
         # 显示音频处理信息
         if hasattr(segment, 'to_legacy_dict'):
             segment_data = segment.to_legacy_dict()
@@ -472,6 +473,7 @@ class AudioConfirmationView:
         elif raw_duration > 0 and raw_duration != actual_duration:
             st.info(f"ℹ️ **音频处理**: 原始时长 {raw_duration:.2f}s → 处理后时长 {actual_duration:.2f}s")
         
+        # 🔥 优先使用内存中的音频数据
         if segment.audio_data is not None:
             try:
                 import tempfile
@@ -482,16 +484,16 @@ class AudioConfirmationView:
                 if is_windows():
                     # Windows系统使用专用工具
                     windows_utils = get_windows_audio_utils()
-                    tmp_path = windows_utils.create_temp_audio_path("preview", segment.id)
+                    tmp_path = windows_utils.create_temp_audio_path("preview", segment.id, ext="mp3")
                     
-                    # 安全导出音频文件
-                    if windows_utils.safe_export_audio(segment.audio_data, tmp_path):
+                    # 安全导出音频文件（MP3 格式，体积更小）
+                    if windows_utils.safe_export_audio(segment.audio_data, tmp_path, format='mp3'):
                         # 读取音频文件内容
                         with open(tmp_path, 'rb') as audio_file:
                             audio_bytes = audio_file.read()
                         
                         # 显示音频播放器
-                        st.audio(audio_bytes, format='audio/wav')
+                        st.audio(audio_bytes, format='audio/mpeg')
                         
                         # 安全清理临时文件
                         windows_utils.safe_cleanup_file(tmp_path)
@@ -500,16 +502,16 @@ class AudioConfirmationView:
                         raise Exception("Windows音频文件导出失败")
                 
                 else:
-                    # 非Windows系统使用原有逻辑
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-                        # 导出音频到临时文件
-                        segment.audio_data.export(tmp_file.name, format='wav')
+                    # 非Windows系统使用原有逻辑（改用 MP3 格式）
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+                        # 导出音频到临时文件（MP3 格式，体积更小）
+                        segment.audio_data.export(tmp_file.name, format='mp3', bitrate='128k')
                         tmp_path = tmp_file.name
                     
                     # 显示音频播放器
                     with open(tmp_path, 'rb') as audio_file:
                         audio_bytes = audio_file.read()
-                        st.audio(audio_bytes, format='audio/wav')
+                        st.audio(audio_bytes, format='audio/mpeg')
                     
                     # 清理临时文件
                     try:
@@ -532,7 +534,206 @@ class AudioConfirmationView:
                     st.write("5. 联系技术支持")
                     
         else:
-            st.warning("⚠️ 音频数据不可用")
+            # 🔥 尝试从 Firebase Storage URL 流式播放（无需下载完整数据）
+            audio_url = self._get_audio_stream_url(segment)
+            if audio_url:
+                st.audio(audio_url, format='audio/mpeg')
+                st.caption("🌐 从云端流式播放")
+            else:
+                st.warning("⚠️ 音频数据不可用，请点击「重新生成」按钮生成音频")
+    
+    def _get_audio_stream_url(self, segment: SegmentDTO) -> str:
+        """
+        获取音频流式播放 URL（从 Firebase Storage）
+        
+        路径来源优先级：
+        1. segment.audio_path（在 _restore_audio_from_storage 中设置的）
+        2. project.audio_storage_paths 中的已确认路径
+        3. project.audio_storage_paths 中的预览路径
+        4. 🔥 智能回退：尝试构建预期路径并直接检查 Storage
+        
+        Args:
+            segment: 片段对象
+            
+        Returns:
+            音频 URL，不可用时返回空字符串
+        """
+        try:
+            current_project = st.session_state.get('current_project')
+            if not current_project:
+                return ""
+            
+            # 检查是否使用 Firebase 存储后端
+            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
+                return ""
+            
+            # 🔥 优先使用 segment 上已设置的 audio_path
+            storage_path = segment.audio_path if segment.audio_path else None
+            
+            # 如果 segment 没有设置路径，从项目的 audio_storage_paths 查找
+            if not storage_path:
+                audio_paths = getattr(current_project, 'audio_storage_paths', {})
+                if audio_paths:
+                    # 优先使用已确认的音频路径，其次使用预览路径
+                    storage_path = audio_paths.get(segment.id) or audio_paths.get(f"{segment.id}_preview")
+            
+            # 获取 Firebase Storage 管理器
+            from utils.firebase_storage import get_storage_manager
+            storage = get_storage_manager()
+            if not storage.is_connected:
+                return ""
+            
+            # 🔥 智能回退：如果没有保存的路径，尝试构建预期路径并直接检查
+            if not storage_path:
+                user_id = getattr(current_project, 'owner_id', '')
+                project_id = getattr(current_project, 'id', '')
+                if user_id and project_id:
+                    # 尝试可能的路径格式（与 _get_staged_audio_path 一致）
+                    # 格式: users/{user_id}/projects/{project_id}/audio/{stage}/{segment_id}.mp3
+                    possible_paths = [
+                        f"users/{user_id}/projects/{project_id}/audio/confirmed/{segment.id}.mp3",
+                        f"users/{user_id}/projects/{project_id}/audio/preview/{segment.id}.mp3",
+                        f"users/{user_id}/projects/{project_id}/audio/{segment.id}.mp3",
+                    ]
+                    for path in possible_paths:
+                        try:
+                            blob = storage.bucket.blob(path)
+                            if blob.exists():
+                                storage_path = path
+                                # 找到了，保存到项目中供下次使用
+                                current_project.update_audio_storage_path(segment.id, path)
+                                logger.info(f"片段 {segment.id} 智能发现音频: {path}")
+                                break
+                        except Exception:
+                            continue
+            
+            if not storage_path:
+                logger.debug(f"片段 {segment.id} 没有可用的音频路径")
+                return ""
+            
+            # 🔥 兼容性处理：检查文件是否存在，如果不存在尝试转换旧格式路径
+            # 旧格式: users/{user_id}/projects/{project_id}/audio/segments/{segment_id}/preview.mp3
+            # 新格式: users/{user_id}/projects/{project_id}/audio/preview/{segment_id}.mp3
+            if '/audio/segments/' in storage_path:
+                # 检查旧格式路径文件是否存在
+                blob = storage.bucket.blob(storage_path)
+                if not blob.exists():
+                    # 尝试转换成新格式
+                    import re
+                    # 提取路径组件
+                    match = re.match(r'(.*/audio)/segments/([^/]+)/(preview|confirmed)\.mp3', storage_path)
+                    if match:
+                        base_path = match.group(1)  # users/.../audio
+                        segment_id = match.group(2)  # seg_1
+                        stage = match.group(3)  # preview 或 confirmed
+                        new_path = f"{base_path}/{stage}/{segment_id}.mp3"
+                        logger.debug(f"片段 {segment.id} 路径兼容转换: {storage_path} -> {new_path}")
+                        # 检查新格式路径是否存在
+                        new_blob = storage.bucket.blob(new_path)
+                        if new_blob.exists():
+                            storage_path = new_path
+                            # 更新项目中的路径映射为正确格式
+                            current_project.update_audio_storage_path(segment.id, new_path)
+                            segment.audio_path = new_path
+            
+            # 获取临时下载 URL（有效期 1 小时）
+            url = storage.get_download_url(storage_path, expiration=3600)
+            if url:
+                logger.debug(f"片段 {segment.id} 音频 URL 获取成功")
+            return url or ""
+            
+        except Exception as e:
+            logger.error(f"获取音频 URL 失败 [{segment.id}]: {e}")
+            return ""
+    
+    def _upload_confirmed_audio(self, segment: SegmentDTO):
+        """
+        Stage 2: 异步上传确认音频到 Firebase Storage，并删除预览音频
+        
+        当用户点击"确认此片段"后调用，将确认版本的音频异步上传，替换预览版本
+        不阻塞主线程，提升用户体验
+        
+        Args:
+            segment: 确认的片段
+        """
+        try:
+            # 获取当前项目信息
+            current_project = st.session_state.get('current_project')
+            if not current_project:
+                logger.debug("无项目信息，跳过确认音频上传")
+                return
+            
+            # 检查是否使用 Firebase 存储后端
+            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
+                logger.debug("非 Firebase 存储后端，跳过确认音频上传")
+                return
+            
+            user_id = getattr(current_project, 'owner_id', '')
+            project_id = getattr(current_project, 'id', '')
+            
+            if not user_id or not project_id:
+                logger.warning("缺少用户 ID 或项目 ID，跳过确认音频上传")
+                return
+            
+            if segment.audio_data is None:
+                logger.warning(f"片段 {segment.id} 没有音频数据，跳过上传")
+                return
+            
+            from utils.firebase_storage import get_storage_manager
+            from utils.async_upload_manager import get_upload_manager
+            
+            storage = get_storage_manager()
+            if not storage.is_connected:
+                logger.warning("Firebase Storage 未连接，跳过确认音频上传")
+                return
+            
+            # 使用异步上传管理器
+            upload_manager = get_upload_manager()
+            
+            # 定义上传完成回调
+            segment_id = segment.id
+            def on_upload_complete(task_id: str, result_path: str, error: str):
+                if error:
+                    logger.warning(f"确认音频上传失败 [{segment_id}]: {error}")
+                    return
+                
+                if result_path:
+                    logger.info(f"片段 {segment_id} Stage 2 确认音频上传成功: {result_path}")
+            
+            # 提交异步上传任务（会自动删除预览版本）
+            upload_manager.submit_confirmed_upload(
+                user_id=user_id,
+                project_id=project_id,
+                segment_id=segment.id,
+                audio_data=segment.audio_data,
+                callback=on_upload_complete
+            )
+            
+            # 预先更新项目的音频路径映射（异步上传完成后实际路径一致）
+            # 路径格式: users/{user_id}/projects/{project_id}/audio/confirmed/{segment_id}.mp3
+            expected_path = f"users/{user_id}/projects/{project_id}/audio/confirmed/{segment.id}.mp3"
+            current_project.update_audio_storage_path(segment.id, expected_path)
+            
+            # 删除预览路径记录
+            if hasattr(current_project, 'audio_storage_paths'):
+                preview_key = f"{segment.id}_preview"
+                if preview_key in current_project.audio_storage_paths:
+                    del current_project.audio_storage_paths[preview_key]
+            
+            logger.debug(f"片段 {segment.id} 确认音频已提交到异步上传队列")
+            
+            # 🔥 重要：保存项目以持久化 audio_storage_paths
+            try:
+                from utils.project_integration import get_project_integration
+                user_id_for_save = st.session_state.get('auth_username', 'default_user')
+                project_integration = get_project_integration(user_id=user_id_for_save)
+                project_integration.save_project_state(current_project, st.session_state)
+                logger.debug(f"已保存确认音频路径: {segment.id}")
+            except Exception as save_err:
+                logger.warning(f"保存确认音频路径时出错: {save_err}")
+                
+        except Exception as e:
+            logger.error(f"上传确认音频失败: {e}")
 
     
     def _regenerate_segment_audio(self, segment: SegmentDTO, target_lang: str, segment_index: int):
@@ -562,8 +763,12 @@ class AudioConfirmationView:
                 st.error("❌ 文本内容为空")
                 return
             
-            user_rate_key = f"user_speech_rate_{segment_index}"
-            user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
+            # ElevenLabs不支持语速调整，固定使用1.0
+            if selected_tts_service == 'elevenlabs':
+                user_rate = 1.0
+            else:
+                user_rate_key = f"user_speech_rate_{segment_index}"
+                user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             
             with st.spinner("🔄 正在生成音频..."):
                 if selected_tts_service == 'elevenlabs' and selected_voice_id:
@@ -844,14 +1049,10 @@ class AudioConfirmationView:
     
     def _smart_iterative_optimization(self, segment: SegmentDTO, target_lang: str, segment_index: int):
         """
-        智能迭代优化：三轮迭代自动优化时长匹配
-        
-        逻辑：
-        1. 第一次用当前文本+语速生成时长
-        2. 如果时长相比目标时长浮动在10%内，微调50%语速；>10%则智能优化文本；符合标准直接输出
-        3. 三轮迭代后输出最优结果（小于目标时长150ms的误差最小的）
+        智能迭代优化：使用公共迭代优化器进行三轮迭代自动优化时长匹配
         """
         from tts import create_tts_engine
+        from utils.audio_iteration_optimizer import AudioIterationOptimizer
         
         try:
             # 获取TTS实例
@@ -884,204 +1085,93 @@ class AudioConfirmationView:
             
             # 获取当前文本和语速
             manual_text_key = f"manual_text_{segment.id}"
-            user_rate_key = f"user_speech_rate_{segment_index}"
-            
             current_text = st.session_state.get(manual_text_key, segment.get_current_text())
-            current_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             target_duration = segment.target_duration
             
-            # 目标标准：小于目标时长150ms以内
-            target_threshold_ms = 150
+            # ElevenLabs不支持语速调整，固定使用1.0
+            supports_speech_rate = selected_tts_service != 'elevenlabs'
+            if supports_speech_rate:
+                user_rate_key = f"user_speech_rate_{segment_index}"
+                initial_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
+            else:
+                initial_rate = 1.0
             
-            # 存储每轮结果
-            iteration_results = []
-            best_result = None
-            
-            # 创建文本优化器
-            optimizer = TextOptimizer(config)
             original_text = segment.original_text or segment.translated_text or current_text
             
             progress_container = st.container()
             
-            # 检查是否已有音频数据，如果有则作为第0轮基础
-            has_existing_audio = segment.audio_data is not None and segment.actual_duration is not None
-            start_iteration = 0
-            
-            if has_existing_audio:
-                # 使用现有数据作为基础
+            # 检查是否已有音频数据，如果有则检查是否已达标
+            if segment.audio_data is not None and segment.actual_duration is not None:
                 existing_duration = segment.actual_duration
                 existing_error_ms = (existing_duration - target_duration) * 1000
-                existing_error_percentage = abs(existing_error_ms) / (target_duration * 1000) * 100
                 
                 with progress_container:
                     error_sign = "+" if existing_error_ms > 0 else ""
-                    st.markdown(f"""
+                    if supports_speech_rate:
+                        st.markdown(f"""
 **当前状态** 📊  
 - 实际时长: **{existing_duration:.2f}s** | 目标: {target_duration:.2f}s  
-- 误差: **{error_sign}{existing_error_ms:.0f}ms** | 语速: {current_rate:.2f}x
-                    """)
+- 误差: **{error_sign}{existing_error_ms:.0f}ms** | 语速: {initial_rate:.2f}x
+                        """)
+                    else:
+                        st.markdown(f"""
+**当前状态** 📊  
+- 实际时长: **{existing_duration:.2f}s** | 目标: {target_duration:.2f}s  
+- 误差: **{error_sign}{existing_error_ms:.0f}ms**
+                        """)
                 
                 # 检查现有数据是否已达标
-                if -target_threshold_ms <= existing_error_ms <= 0:
+                if -150 <= existing_error_ms <= 0:
                     st.success(f"✅ 当前已达标！实际时长 {existing_duration:.2f}s（短于目标 {abs(existing_error_ms):.0f}ms）")
                     return
-                
-                # 根据现有数据决定优化策略，不需要重新生成第一轮
-                logger.info(f"使用现有数据: 时长={existing_duration:.2f}s, 误差={existing_error_ms:.0f}ms, 开始优化...")
-                
-                # 先根据现有数据调整策略
-                # 只有误差>10%且>2秒才触发文本优化
-                if existing_error_percentage <= 10 or abs(existing_error_ms) <= 2000:
-                    # 误差小（10%内或2秒内），只需微调语速
-                    ideal_rate = existing_duration / target_duration * current_rate
-                    adjustment = (ideal_rate - current_rate) * 0.5
-                    current_rate = max(0.95, min(1.15, current_rate + adjustment))
-                    logger.info(f"基于现有数据微调语速至 {current_rate:.2f}x (误差{existing_error_percentage:.1f}%, {existing_error_ms:.0f}ms)")
-                else:
-                    # 误差大（>10%且>2秒），需要优化文本
-                    with progress_container:
-                        st.info(f"📝 误差>{10}%且>{2}秒，正在优化文本...")
-                    
-                    optimized_text = optimizer.optimize_text_for_duration(
-                        original_text=original_text,
-                        current_text=current_text,
-                        target_duration=target_duration,
-                        actual_duration=existing_duration,
-                        target_language=target_lang,
-                        original_language='zh'
-                    )
-                    
-                    if optimized_text and optimized_text != current_text:
-                        current_text = optimized_text
-                        logger.info(f"基于现有数据优化文本完成")
             
-            for iteration in range(3):
+            # 创建文本优化器和迭代优化器
+            text_optimizer = TextOptimizer(config)
+            iteration_optimizer = AudioIterationOptimizer(
+                tts_engine=tts,
+                text_optimizer=text_optimizer,
+                supports_speech_rate=supports_speech_rate
+            )
+            
+            # 显示优化进度的回调函数
+            def progress_callback(iteration: int, message: str):
                 with progress_container:
-                    st.info(f"🔄 **第 {iteration + 1}/3 轮** | 目标: {target_duration:.2f}s | 语速: {current_rate:.2f}x | 生成中...")
-                
-                # 生成音频
-                audio_data = tts._generate_single_audio(
-                    current_text,
-                    voice_name,
-                    current_rate,
-                    target_duration
+                    st.info(f"🔄 **第 {iteration}/3 轮** | 目标: {target_duration:.2f}s | {message} | 生成中...")
+            
+            # 使用迭代优化器进行优化
+            with st.spinner("智能优化中..."):
+                result = iteration_optimizer.optimize_segment(
+                    text=current_text,
+                    original_text=original_text,
+                    voice_name=voice_name,
+                    target_duration=target_duration,
+                    target_language=target_lang,
+                    initial_speech_rate=initial_rate,
+                    source_language='zh',
+                    progress_callback=progress_callback
                 )
-                
-                actual_duration = len(audio_data) / 1000.0
-                error_ms = (actual_duration - target_duration) * 1000
-                error_percentage = abs(error_ms) / (target_duration * 1000) * 100
-                
-                logger.info(f"迭代{iteration+1}: 时长={actual_duration:.2f}s, 误差={error_ms:.0f}ms ({error_percentage:.1f}%), 语速={current_rate:.2f}")
-                
-                # 保存本轮结果
-                result = {
-                    'iteration': iteration + 1,
-                    'text': current_text,
-                    'speech_rate': current_rate,
-                    'audio_data': audio_data,
-                    'actual_duration': actual_duration,
-                    'error_ms': error_ms,
-                    'error_percentage': error_percentage
-                }
-                iteration_results.append(result)
-                
-                # 更新进度显示，展示本轮结果
-                # 标准：实际时长 < 目标时长，且差距不超过150ms（即 -150ms <= error_ms <= 0）
-                is_valid = -target_threshold_ms <= error_ms <= 0
-                error_sign = "+" if error_ms > 0 else ""
-                status_icon = "✅" if is_valid else ("⚠️" if abs(error_ms) < 500 else "🔄")
-                status_text = "短于目标" if error_ms < 0 else ("超出目标" if error_ms > 0 else "完美匹配")
-                
-                with progress_container:
-                    st.empty()  # 清除之前的内容
-                    st.markdown(f"""
-**第 {iteration + 1}/3 轮结果** {status_icon}  
-- 实际时长: **{actual_duration:.2f}s** | 目标: {target_duration:.2f}s  
-- 误差: **{error_sign}{error_ms:.0f}ms** ({status_text})  
-- 语速: {current_rate:.2f}x
-                    """)
-                
-                # 检查是否符合标准：实际时长 <= 目标时长，且差距不超过150ms
-                if is_valid:
-                    logger.info(f"✅ 迭代{iteration+1}达到标准! 实际{actual_duration:.2f}s < 目标{target_duration:.2f}s, 误差={error_ms:.0f}ms")
-                    best_result = result
-                    with progress_container:
-                        st.success(f"🎉 第{iteration+1}轮达标！实际时长 {actual_duration:.2f}s（短于目标 {abs(error_ms):.0f}ms）")
-                    break
-                
-                # 如果是最后一轮，不需要继续优化
-                if iteration == 2:
-                    break
-                
-                # 决定下一轮的优化策略
-                # 只有误差>10%且>2秒才触发文本优化
-                next_strategy = ""
-                if error_percentage <= 10 or abs(error_ms) <= 2000:
-                    # 误差小（10%内或2秒内），微调语速（调整50%）
-                    ideal_rate = actual_duration / target_duration * current_rate
-                    adjustment = (ideal_rate - current_rate) * 0.5
-                    current_rate = max(0.95, min(1.15, current_rate + adjustment))
-                    
-                    next_strategy = f"微调语速 → {current_rate:.2f}x"
-                    logger.info(f"微调语速至 {current_rate:.2f}x (误差{error_percentage:.1f}%, {error_ms:.0f}ms)")
-                else:
-                    # 误差大（>10%且>2秒），进入智能优化文本逻辑
-                    with progress_container:
-                        st.info(f"📝 误差>{10}%且>{2}秒，正在优化文本...")
-                    
-                    optimized_text = optimizer.optimize_text_for_duration(
-                        original_text=original_text,
-                        current_text=current_text,
-                        target_duration=target_duration,
-                        actual_duration=actual_duration,
-                        target_language=target_lang,
-                        original_language='zh'
-                    )
-                    
-                    text_changed = optimized_text and optimized_text != current_text
-                    if text_changed:
-                        current_text = optimized_text
-                        next_strategy = "文本已优化"
-                        logger.info(f"文本已优化，保持语速 {current_rate:.2f}x")
-                    else:
-                        # 文本没变化，微调语速
-                        if error_ms > 0:
-                            current_rate = min(1.15, current_rate + 0.03)
-                        else:
-                            current_rate = max(0.95, current_rate - 0.03)
-                        next_strategy = f"微调语速 → {current_rate:.2f}x"
-                        logger.info(f"文本无变化，微调语速至 {current_rate:.2f}x")
-                
-                # 显示下一步策略
-                if iteration < 2 and next_strategy:
-                    with progress_container:
-                        st.caption(f"➡️ 下一步: {next_strategy}")
             
-            # 如果没有达到标准，选择最优结果
-            if not best_result:
-                # 优先选择实际时长 <= 目标时长的结果（error_ms <= 0）
-                under_target_results = [r for r in iteration_results if r['error_ms'] <= 0]
-                
-                if under_target_results:
-                    # 在实际时长<=目标时长的结果中，选择最接近目标的（误差绝对值最小）
-                    best_result = min(under_target_results, key=lambda x: abs(x['error_ms']))
-                else:
-                    # 没有实际时长<=目标时长的结果，选择超出最少的（error_ms最小的正值）
-                    best_result = min(iteration_results, key=lambda x: x['error_ms'])
+            if not result['success'] or not result['best_result']:
+                st.error("❌ 优化失败：未能生成有效的音频")
+                return
+            
+            best = result['best_result']
+            all_results = result['all_results']
             
             # 应用最优结果
-            segment.set_audio_data(best_result['audio_data'])
-            segment.speech_rate = best_result['speech_rate']
-            segment.update_final_text(best_result['text'])
+            segment.set_audio_data(best.audio_data)
+            segment.speech_rate = best.speech_rate
+            segment.update_final_text(best.text)
             
-            # 更新UI状态 - 使用重置机制避免直接修改widget的session_state
-            st.session_state[manual_text_key] = best_result['text']
+            # 更新UI状态
+            st.session_state[manual_text_key] = best.text
             
-            # 语速使用重置机制
-            reset_rate_key = f"reset_rate_{segment_index}"
-            suggested_rate_key = f"suggested_rate_{segment_index}"
-            st.session_state[reset_rate_key] = True
-            st.session_state[suggested_rate_key] = best_result['speech_rate']
+            # 语速使用重置机制（仅对支持语速的TTS）
+            if supports_speech_rate:
+                reset_rate_key = f"reset_rate_{segment_index}"
+                suggested_rate_key = f"suggested_rate_{segment_index}"
+                st.session_state[reset_rate_key] = True
+                st.session_state[suggested_rate_key] = best.speech_rate
             
             # 设置文本重置标记
             reset_key = f"reset_text_{segment.id}"
@@ -1102,13 +1192,19 @@ class AudioConfirmationView:
                 segment.quality = 'poor'
             
             # 显示结果
-            st.success(f"✅ 智能优化完成！第{best_result['iteration']}轮 | 误差: {best_result['error_ms']:.0f}ms | 语速: {best_result['speech_rate']:.2f}x")
+            if supports_speech_rate:
+                st.success(f"✅ 智能优化完成！第{best.iteration}轮 | 误差: {best.error_ms:.0f}ms | 语速: {best.speech_rate:.2f}x")
+            else:
+                st.success(f"✅ 智能优化完成！第{best.iteration}轮 | 误差: {best.error_ms:.0f}ms")
             
             # 显示迭代详情
             with st.expander("📊 迭代详情", expanded=False):
-                for r in iteration_results:
-                    status = "✅" if r == best_result else "⚪"
-                    st.caption(f"{status} 第{r['iteration']}轮: 误差={r['error_ms']:.0f}ms ({r['error_percentage']:.1f}%), 语速={r['speech_rate']:.2f}x")
+                for r in all_results:
+                    status = "✅" if r == best else "⚪"
+                    if supports_speech_rate:
+                        st.caption(f"{status} 第{r.iteration}轮: 误差={r.error_ms:.0f}ms ({r.error_percentage:.1f}%), 语速={r.speech_rate:.2f}x")
+                    else:
+                        st.caption(f"{status} 第{r.iteration}轮: 误差={r.error_ms:.0f}ms ({r.error_percentage:.1f}%)")
             
             st.rerun()
             

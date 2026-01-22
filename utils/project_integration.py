@@ -1,28 +1,91 @@
 """
 工程集成模块
 在各个处理阶段集成工程管理功能，提供工程的保存、加载和状态更新
+支持本地存储和 Firebase 云端存储两种后端
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from loguru import logger
 from pathlib import Path
 import streamlit as st
 import hashlib
 import time
 
-from .project_manager import get_project_manager
+from .project_manager import get_project_manager, ProjectManager
 from .cache_integration import get_cache_integration
+from .config_manager import get_global_config_manager
 from models.project_dto import ProjectDTO
 from models.segment_dto import SegmentDTO
 
+# Firebase 支持（可选）
+try:
+    from .firebase_project_manager import FirebaseProjectManager, get_firebase_project_manager
+    FIREBASE_SUPPORT = True
+except ImportError:
+    FIREBASE_SUPPORT = False
+    logger.debug("Firebase 支持未启用")
+
 
 class ProjectIntegration:
-    """工程集成类 - 管理工程的完整生命周期集成"""
+    """
+    工程集成类 - 管理工程的完整生命周期集成
+    支持本地存储和 Firebase 云端存储两种后端
+    """
     
-    def __init__(self):
-        """初始化工程集成"""
-        self.project_manager = get_project_manager()
+    def __init__(self, user_id: Optional[str] = None, use_firebase: Optional[bool] = None):
+        """
+        初始化工程集成
+        
+        Args:
+            user_id: 用户 ID（Firebase 模式必需）
+            use_firebase: 是否使用 Firebase 后端（None 则从配置读取）
+        """
+        self.user_id = user_id
         self.cache_integration = get_cache_integration()  # 兼容旧缓存系统
+        
+        # 确定存储后端
+        config_manager = get_global_config_manager()
+        config = config_manager.load_config() or {}
+        
+        if use_firebase is None:
+            # 从配置读取
+            self._use_firebase = config.get('firebase', {}).get('enabled', False)
+        else:
+            self._use_firebase = use_firebase
+        
+        # 初始化项目管理器
+        if self._use_firebase and FIREBASE_SUPPORT and user_id:
+            self.project_manager = get_firebase_project_manager(user_id, config)
+            self._storage_backend = "firebase"
+            logger.info(f"使用 Firebase 存储后端 (用户: {user_id})")
+        else:
+            self.project_manager = get_project_manager()
+            self._storage_backend = "local"
+            if self._use_firebase and not FIREBASE_SUPPORT:
+                logger.warning("Firebase 支持未安装，回退到本地存储")
+            elif self._use_firebase and not user_id:
+                logger.warning("未提供用户 ID，回退到本地存储")
+    
+    @property
+    def storage_backend(self) -> str:
+        """获取当前存储后端类型"""
+        return self._storage_backend
+    
+    def set_user(self, user_id: str):
+        """
+        设置当前用户（用于 Firebase 模式）
+        
+        Args:
+            user_id: 用户 ID
+        """
+        self.user_id = user_id
+        
+        if self._use_firebase and FIREBASE_SUPPORT:
+            config_manager = get_global_config_manager()
+            config = config_manager.load_config() or {}
+            self.project_manager = get_firebase_project_manager(user_id, config)
+            self._storage_backend = "firebase"
+            logger.info(f"切换到 Firebase 存储后端 (用户: {user_id})")
         
     def create_project_from_file(self, filename: str, file_content: bytes, 
                                project_name: str = "", description: str = "") -> Optional[ProjectDTO]:
@@ -48,6 +111,20 @@ class ProjectIntegration:
                 file_content=file_content,
                 description=description
             )
+            
+            # 记录项目创建活动日志
+            if self.user_id and project:
+                try:
+                    from .firebase_activity_logger import get_activity_logger
+                    activity_logger = get_activity_logger()
+                    activity_logger.log_project_create(
+                        user_id=self.user_id,
+                        project_id=project.id,
+                        project_name=project.name,
+                        filename=filename
+                    )
+                except Exception as e:
+                    logger.debug(f"记录项目创建日志失败（非关键）: {e}")
             
             logger.info(f"从文件创建工程成功: {project.name}")
             return project
@@ -155,8 +232,22 @@ class ProjectIntegration:
             # 确保工程数据同步到session_data中
             session_data['current_project'] = project
             
-            # 保存工程
-            success = self.project_manager.save_project(project)
+            # 保存工程（根据阶段选择保存策略）
+            # 关键阶段使用立即保存，普通阶段使用防抖保存
+            # 注意：confirm_segmentation 阶段不再频繁保存，只在用户点击确认时才触发
+            is_critical_stage = processing_stage in ['completion', 'language_selection']
+            
+            if is_critical_stage and self._storage_backend == "firebase":
+                # 关键阶段：立即保存，确保数据不丢失
+                if hasattr(self.project_manager, 'save_project_immediate'):
+                    success = self.project_manager.save_project_immediate(project)
+                    logger.info(f"关键阶段立即保存: {project.name} - {processing_stage}")
+                else:
+                    success = self.project_manager.save_project(project)
+            else:
+                # 普通阶段：使用默认保存（Firebase 会防抖）
+                success = self.project_manager.save_project(project)
+            
             if success:
                 logger.info(f"工程状态保存成功: {project.name} - {processing_stage} ({project.completion_percentage:.1f}%)")
             else:
@@ -231,8 +322,27 @@ class ProjectIntegration:
                     SegmentDTO.from_legacy_segment(seg) for seg in project.final_segments
                 ]
             
+            # 🔥 重要：将项目的 audio_storage_paths 应用到加载的片段
+            audio_paths = getattr(project, 'audio_storage_paths', {})
+            if audio_paths:
+                self._apply_audio_paths_to_segments(session_data, audio_paths)
+                logger.debug(f"已应用 {len(audio_paths)} 条音频路径到片段")
+            
             # 验证数据完整性
             self._validate_session_data_integrity(session_data, project)
+            
+            # 记录项目加载活动日志
+            if self.user_id:
+                try:
+                    from .firebase_activity_logger import get_activity_logger
+                    activity_logger = get_activity_logger()
+                    activity_logger.log_project_load(
+                        user_id=self.user_id,
+                        project_id=project.id,
+                        project_name=project.name
+                    )
+                except Exception as e:
+                    logger.debug(f"记录项目加载日志失败（非关键）: {e}")
             
             logger.info(f"工程加载到会话成功: {project.name} - {project.processing_stage}")
             return True
@@ -270,6 +380,47 @@ class ProjectIntegration:
                 
         except Exception as e:
             logger.error(f"数据完整性验证失败: {e}")
+    
+    def _apply_audio_paths_to_segments(self, session_data: Dict[str, Any], audio_paths: Dict[str, str]):
+        """
+        将项目的音频存储路径应用到加载的片段
+        
+        这样片段在渲染时可以直接使用 URL 流式播放，无需重新生成音频
+        
+        Args:
+            session_data: 会话数据
+            audio_paths: 音频存储路径映射 {segment_id: storage_path, segment_id_preview: storage_path}
+        """
+        if not audio_paths:
+            return
+        
+        # 需要应用路径的片段字段
+        segment_fields = [
+            'translated_segments',
+            'optimized_segments', 
+            'confirmation_segments'
+        ]
+        
+        applied_count = 0
+        for field_name in segment_fields:
+            segments = session_data.get(field_name, [])
+            if not segments:
+                logger.debug(f"_apply_audio_paths_to_segments: {field_name} 为空或不存在")
+                continue
+            
+            
+            for seg in segments:
+                if seg.audio_data is not None:
+                    # 已有内存音频数据，跳过
+                    continue
+                
+                # 查找音频路径（优先 confirmed，其次 preview）
+                storage_path = audio_paths.get(seg.id) or audio_paths.get(f"{seg.id}_preview")
+                logger.debug(f"片段 {seg.id}: 查找路径, seg.id={seg.id}, {seg.id}_preview={seg.id}_preview, 找到={storage_path}")
+                if storage_path:
+                    seg.audio_path = storage_path
+                    applied_count += 1
+                    logger.debug(f"片段 {seg.id}: 设置 audio_path = {storage_path}")
     
     def check_existing_projects_for_file(self, filename: str, file_content: bytes) -> List[Dict[str, Any]]:
         """
@@ -350,6 +501,28 @@ class ProjectIntegration:
         except Exception as e:
             logger.error(f"自动保存工程进度失败: {e}")
             return False
+    
+    def flush_pending_saves(self):
+        """
+        刷新所有待保存的数据（用于程序退出或关键节点）
+        
+        对于 Firebase 后端，会立即执行所有排队中的保存操作
+        对于本地后端，此方法无操作（本地保存是同步的）
+        """
+        if self._storage_backend == "firebase" and hasattr(self.project_manager, 'flush_pending_saves'):
+            self.project_manager.flush_pending_saves()
+            logger.info("已刷新所有待保存的 Firebase 数据")
+    
+    def get_save_stats(self) -> Dict[str, Any]:
+        """
+        获取保存统计信息（用于调试）
+        
+        Returns:
+            保存统计字典
+        """
+        if self._storage_backend == "firebase" and hasattr(self.project_manager, 'get_save_stats'):
+            return self.project_manager.get_save_stats()
+        return {'backend': self._storage_backend, 'pending_saves': 0}
     
     def get_compatible_cache_data(self, file_content: bytes) -> Optional[Dict[str, Any]]:
         """
@@ -554,13 +727,67 @@ class ProjectIntegration:
             return 0
 
 
-# 全局工程集成实例
-_global_project_integration = None
+# 全局工程集成实例（按用户 ID 缓存）
+_project_integrations: Dict[str, ProjectIntegration] = {}
+_default_project_integration: Optional[ProjectIntegration] = None
 
 
-def get_project_integration() -> ProjectIntegration:
-    """获取全局工程集成实例"""
-    global _global_project_integration
-    if _global_project_integration is None:
-        _global_project_integration = ProjectIntegration()
-    return _global_project_integration
+def get_project_integration(user_id: Optional[str] = None) -> ProjectIntegration:
+    """
+    获取工程集成实例
+    
+    Args:
+        user_id: 用户 ID，如果为 None 则返回默认实例（本地模式）
+        
+    Returns:
+        ProjectIntegration 实例
+    """
+    global _project_integrations, _default_project_integration
+    
+    if user_id:
+        # 按用户返回实例（支持 Firebase 用户隔离）
+        if user_id not in _project_integrations:
+            _project_integrations[user_id] = ProjectIntegration(user_id=user_id)
+        return _project_integrations[user_id]
+    else:
+        # 返回默认实例（本地模式）
+        if _default_project_integration is None:
+            _default_project_integration = ProjectIntegration()
+        return _default_project_integration
+
+
+def clear_project_integration_cache():
+    """清除所有缓存的工程集成实例"""
+    global _project_integrations, _default_project_integration
+    _project_integrations.clear()
+    _default_project_integration = None
+    logger.debug("工程集成缓存已清除")
+
+
+def flush_all_pending_saves():
+    """
+    刷新所有工程集成实例的待保存数据
+    应在程序退出时调用，确保所有数据都已保存
+    """
+    global _project_integrations, _default_project_integration
+    
+    flushed_count = 0
+    
+    # 刷新所有用户实例
+    for user_id, integration in _project_integrations.items():
+        try:
+            integration.flush_pending_saves()
+            flushed_count += 1
+        except Exception as e:
+            logger.error(f"刷新用户 {user_id} 的待保存数据失败: {e}")
+    
+    # 刷新默认实例
+    if _default_project_integration:
+        try:
+            _default_project_integration.flush_pending_saves()
+            flushed_count += 1
+        except Exception as e:
+            logger.error(f"刷新默认实例的待保存数据失败: {e}")
+    
+    if flushed_count > 0:
+        logger.info(f"已刷新 {flushed_count} 个工程集成实例的待保存数据")

@@ -22,8 +22,14 @@ output/
 *.wav
 *.mp3
 *.srt
-*.txt
 *.log
+# 注意：不要忽略所有 .txt，只忽略输出目录下的
+output/*.txt
+
+# 保留重要的 txt 文件
+!requirements*.txt
+!README*.txt
+!LICENSE*.txt
 
 # Python
 __pycache__/
