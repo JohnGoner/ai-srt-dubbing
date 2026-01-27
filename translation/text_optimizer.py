@@ -171,6 +171,15 @@ class TextOptimizer:
         # 根据时长差距决定修改力度（越大越激进）
         diff_ms = abs(duration_diff_ms)
         
+        # 对于极小的调整（<400ms），优先尝试标点符号调整
+        if diff_ms < 400 and not force:
+            punctuation_result = self._try_punctuation_only_adjustment(
+                current_text, action, diff_ms, target_language
+            )
+            if punctuation_result and punctuation_result != current_text:
+                logger.info(f"标点微调: 需要{action}{diff_ms:.0f}ms, 仅通过标点符号调整")
+                return punctuation_result
+        
         if diff_ms > 5000:  # >5秒：非常激进
             discount = 0.9
             max_change = 10
@@ -188,8 +197,10 @@ class TextOptimizer:
         llm_estimated_words = max(1, int(current_word_count * llm_percentage / 100 + 0.5))
         target_change_words = max(1, min(llm_estimated_words, max_change))
         
-        logger.info(f"渐进式优化: 需要{action}{abs(duration_diff_ms):.0f}ms, "
-                   f"当前{current_word_count}词, 本轮目标{action}{target_change_words}词")
+        # 统计当前标点符号
+        comma_count = current_text.count(',')
+        logger.info(f"渐进式优化: 需要{action}{diff_ms:.0f}ms, "
+                   f"当前{current_word_count}词/{comma_count}逗号, 本轮目标{action}{target_change_words}词")
         
         # 传入target_change_words（已经限制过的词数）
         optimized_text = self._call_llm_with_ratio_control(
@@ -249,6 +260,109 @@ class TextOptimizer:
         
         return adjustment_percentage, estimated_words
     
+    def _try_punctuation_only_adjustment(
+        self,
+        text: str,
+        action: str,
+        diff_ms: float,
+        target_language: str
+    ) -> Optional[str]:
+        """
+        尝试仅通过标点符号调整来匹配时长（不调用LLM，快速且免费）
+        
+        Args:
+            text: 当前文本
+            action: 动作（缩短/延长）
+            diff_ms: 时长差距(ms)
+            target_language: 目标语言
+            
+        Returns:
+            调整后的文本，如果无法调整返回None
+        """
+        import re
+        
+        # 每个逗号约产生250-350ms停顿
+        MS_PER_COMMA = 300
+        
+        if action == "缩短":
+            # 需要缩短时间，尝试删除不必要的逗号
+            comma_count = text.count(',')
+            if comma_count == 0:
+                return None
+            
+            # 计算需要删除几个逗号
+            commas_to_remove = min(comma_count, int(diff_ms / MS_PER_COMMA) + 1)
+            if commas_to_remove == 0:
+                return None
+            
+            # 找到可以安全删除的逗号位置（优先删除连接词前后的逗号）
+            # 安全删除模式：", and" ", but" ", so" ", or" 等前的逗号
+            safe_patterns = [
+                (r',\s+(and|but|so|or|yet)\s+', r' \1 '),  # ", and X" -> " and X"
+                (r',\s+(which|who|that)\s+', r' \1 '),      # 非限定性从句的逗号
+            ]
+            
+            result = text
+            removed = 0
+            
+            # 先尝试安全删除
+            for pattern, replacement in safe_patterns:
+                if removed >= commas_to_remove:
+                    break
+                match = re.search(pattern, result, re.IGNORECASE)
+                if match:
+                    result = re.sub(pattern, replacement, result, count=1, flags=re.IGNORECASE)
+                    removed += 1
+            
+            # 如果还需要删除更多，从后往前删除普通逗号
+            while removed < commas_to_remove and ',' in result:
+                # 找到最后一个逗号（通常是最不重要的）
+                last_comma = result.rfind(',')
+                if last_comma > 0:
+                    result = result[:last_comma] + result[last_comma+1:]
+                    removed += 1
+                else:
+                    break
+            
+            if removed > 0:
+                logger.debug(f"标点微调：删除了{removed}个逗号")
+                return result.strip()
+            
+        else:  # 延长
+            # 需要延长时间，尝试在适当位置添加逗号
+            commas_to_add = min(2, int(diff_ms / MS_PER_COMMA) + 1)
+            
+            # 寻找适合添加逗号的位置
+            # 1. 连接词前（and, but, so, or, yet, however）
+            # 2. 副词短语后（however, therefore, moreover, indeed）
+            # 3. 介词短语后
+            
+            add_patterns = [
+                (r'\s+(and|but|so|or|yet)\s+', r', \1 '),         # "X and Y" -> "X, and Y"
+                (r'^(However|Therefore|Moreover|Indeed|Furthermore)\s+', r'\1, '),  # 句首副词
+                (r'\s+(however|therefore|moreover|indeed)\s+', r', \1, '),  # 句中副词
+            ]
+            
+            result = text
+            added = 0
+            
+            for pattern, replacement in add_patterns:
+                if added >= commas_to_add:
+                    break
+                # 检查是否已经有逗号在这个位置
+                if re.search(pattern, result, re.IGNORECASE):
+                    # 确保不会重复添加
+                    test_result = re.sub(pattern, replacement, result, count=1, flags=re.IGNORECASE)
+                    if test_result.count(',') > result.count(','):
+                        result = test_result
+                        added += 1
+            
+            if added > 0:
+                logger.debug(f"标点微调：添加了{added}个逗号")
+                return result.strip()
+        
+        return None
+    
     def _call_llm_with_ratio_control(
         self,
         original_text: str,
@@ -292,8 +406,25 @@ class TextOptimizer:
         # 使用上层传入的词数（不再重新计算，避免覆盖）
         target_change_words = llm_estimated_words
         
-        # 计算当前文本字符数（用于音节估算）
-        current_char_count = len(current_text.replace(' ', ''))
+        # 分析当前标点符号情况
+        current_comma_count = current_text.count(',')
+        diff_ms = abs(duration_diff_ms)
+        
+        # 标点符号调整策略：每个逗号约影响200-400ms
+        # 对于小幅度调整，优先考虑标点符号
+        punctuation_hint = ""
+        if diff_ms < 800:  # 小于800ms的调整，可以优先用标点
+            if action == "缩短" and current_comma_count > 0:
+                commas_to_remove = min(2, current_comma_count, int(diff_ms / 300) + 1)
+                punctuation_hint = f"\n【标点优化】可删除 {commas_to_remove} 个逗号来缩短停顿（每个逗号约300ms）"
+            elif action == "延长":
+                commas_to_add = min(2, int(diff_ms / 300) + 1)
+                punctuation_hint = f"\n【标点优化】可在适当位置添加 {commas_to_add} 个逗号来增加停顿（每个逗号约300ms）"
+        elif diff_ms < 1500:  # 中等调整，词数+标点配合
+            if action == "缩短" and current_comma_count > 1:
+                punctuation_hint = f"\n【辅助】可同时删除1-2个不必要的逗号"
+            elif action == "延长":
+                punctuation_hint = f"\n【辅助】可在从句连接处添加逗号"
         
         # 构建严格词数控制的prompt（核心：精确控制修改幅度）
         if action == "缩短":
@@ -304,14 +435,15 @@ class TextOptimizer:
 规则：
 1. 只能删除 {target_change_words} 个词，不能多删
 2. 保持句子主体结构完全不变
-3. 直接输出结果，无解释"""
+3. 可以删除不必要的逗号来缩短停顿
+4. 直接输出结果，无解释"""
 
-            user_prompt = f"""输入（{current_word_count}词）: "{current_text}"
+            user_prompt = f"""输入（{current_word_count}词，{current_comma_count}个逗号）: "{current_text}"
 
 任务：删除恰好 {target_change_words} 个词
 目标：{target_word_count} 词
 
-删除优先级：副词 > 形容词 > 介词短语
+删除优先级：副词 > 形容词 > 介词短语{punctuation_hint}
 禁止：重写句子、改变句式、删除主语谓语宾语
 
 输出（必须 {target_word_count} 词）:"""
@@ -323,15 +455,16 @@ class TextOptimizer:
 规则：
 1. 只能添加 {target_change_words} 个词，不能多加
 2. 保持句子主体结构完全不变
-3. 直接输出结果，无解释"""
+3. 可以在适当位置添加逗号来增加停顿
+4. 直接输出结果，无解释"""
 
-            user_prompt = f"""输入（{current_word_count}词）: "{current_text}"
+            user_prompt = f"""输入（{current_word_count}词，{current_comma_count}个逗号）: "{current_text}"
 参考原意: "{original_text}"
 
 任务：添加恰好 {target_change_words} 个词
 目标：{target_word_count} 词
 
-添加方式：插入副词/形容词修饰现有词
+添加方式：插入副词/形容词修饰现有词{punctuation_hint}
 禁止：重写句子、改变句式
 
 输出（必须 {target_word_count} 词）:"""

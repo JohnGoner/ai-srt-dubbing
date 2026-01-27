@@ -65,6 +65,10 @@ class ElevenLabsTTS:
         self.style = elevenlabs_config.get('style', 0.0)
         self.use_speaker_boost = elevenlabs_config.get('use_speaker_boost', True)
         
+        # ElevenLabs 语速限制：0.7 - 1.2（官方文档限制）
+        self.min_speech_rate = 0.7
+        self.max_speech_rate = 1.2
+        
         # 基础语音参数
         self.base_speech_rate = self.tts_config.get('speech_rate', 1.0)
         self.pitch = self.tts_config.get('pitch', 0)
@@ -252,7 +256,7 @@ class ElevenLabsTTS:
         Args:
             text: 文本内容
             voice_id: 语音ID
-            speech_rate: 语速倍率（ElevenLabs不直接支持，通过后处理实现）
+            speech_rate: 语速倍率 (ElevenLabs API支持 0.7-1.2)
             target_duration: 目标时长
             
         Returns:
@@ -264,6 +268,10 @@ class ElevenLabsTTS:
             try:
                 self._wait_for_rate_limit()
                 self._track_api_call(text)
+                
+                # 计算有效语速，限制在 API 支持范围内 (0.7-1.2)
+                effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
+                api_rate = max(self.min_speech_rate, min(self.max_speech_rate, effective_rate))
                 
                 # 构建请求
                 url = f"{self.base_url}/text-to-speech/{voice_id}"
@@ -281,9 +289,12 @@ class ElevenLabsTTS:
                         "stability": self.stability,
                         "similarity_boost": self.similarity_boost,
                         "style": self.style,
-                        "use_speaker_boost": self.use_speaker_boost
+                        "use_speaker_boost": self.use_speaker_boost,
+                        "speed": api_rate  # 使用API原生语速参数
                     }
                 }
+                
+                logger.debug(f"ElevenLabs TTS请求 - 语速: {api_rate:.3f}")
                 
                 response = requests.post(url, json=payload, headers=headers, timeout=30)
                 
@@ -302,18 +313,8 @@ class ElevenLabsTTS:
                     audio_io = io.BytesIO(audio_data)
                     audio_segment = AudioSegment.from_mp3(audio_io)
                     
-                    # 如果需要调整语速
-                    effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
-                    if effective_rate != 1.0:
-                        # 通过改变采样率来调整语速
-                        new_frame_rate = int(audio_segment.frame_rate * effective_rate)
-                        audio_segment = audio_segment._spawn(
-                            audio_segment.raw_data,
-                            overrides={'frame_rate': new_frame_rate}
-                        ).set_frame_rate(audio_segment.frame_rate)
-                    
                     actual_duration = len(audio_segment) / 1000.0
-                    logger.debug(f"ElevenLabs音频生成成功 - 语速: {effective_rate:.3f}, 时长: {actual_duration:.2f}s")
+                    logger.debug(f"ElevenLabs音频生成成功 - 语速: {api_rate:.3f}, 时长: {actual_duration:.2f}s")
                     
                     return audio_segment
                     
@@ -413,12 +414,58 @@ class ElevenLabsTTS:
         return estimated_duration
     
     def estimate_optimal_speech_rate(self, text: str, language: str, target_duration: float,
-                                   min_rate: float = 0.5, max_rate: float = 2.0) -> float:
-        """估算达到目标时长所需的最优语速"""
+                                   min_rate: float = None, max_rate: float = None) -> float:
+        """
+        估算达到目标时长所需的最优语速
+        
+        Args:
+            text: 文本内容
+            language: 语言代码
+            target_duration: 目标时长（秒）
+            min_rate: 最小语速（默认 0.7）
+            max_rate: 最大语速（默认 1.2）
+            
+        Returns:
+            最优语速倍率（限制在 0.7-1.2 范围内）
+        """
+        # 使用 ElevenLabs API 支持的语速范围
+        effective_min = min_rate if min_rate is not None else self.min_speech_rate
+        effective_max = max_rate if max_rate is not None else self.max_speech_rate
+        
         base_duration = self.estimate_audio_duration_optimized(text, language, 1.0)
         required_rate = base_duration / target_duration
-        optimal_rate = max(min_rate, min(required_rate, max_rate))
+        optimal_rate = max(effective_min, min(required_rate, effective_max))
+        
+        logger.debug(f"ElevenLabs语速估算: 基础时长={base_duration:.2f}s, 目标={target_duration:.2f}s, "
+                    f"所需={required_rate:.3f}, 最优={optimal_rate:.3f}")
+        
         return optimal_rate
+    
+    def get_optimal_rate_for_language(self, language: str, base_rate: float = 1.0) -> float:
+        """
+        获取语言的最优语速
+        
+        Args:
+            language: 语言代码
+            base_rate: 基础语速
+            
+        Returns:
+            最优语速（限制在 0.7-1.2 范围内）
+        """
+        return max(self.min_speech_rate, min(self.max_speech_rate, base_rate))
+    
+    def get_speech_rate_limits(self) -> Dict[str, float]:
+        """
+        获取语速限制信息
+        
+        Returns:
+            包含语速限制的字典
+        """
+        return {
+            'min': self.min_speech_rate,
+            'max': self.max_speech_rate,
+            'default': 1.0
+        }
     
     def _create_silence_segment(self, segment: Dict[str, Any]) -> Dict[str, Any]:
         """创建静音片段"""
@@ -614,6 +661,19 @@ class ElevenLabsTTS:
         total_segments = len(segments)
         total_duration = sum(seg.get('actual_duration', seg.get('duration', 0)) for seg in segments)
         
+        # 统计语速分布
+        speeds = [seg.get('final_speed', 1.0) for seg in segments]
+        avg_speed = sum(speeds) / len(speeds) if speeds else 1.0
+        min_speed = min(speeds) if speeds else 1.0
+        max_speed = max(speeds) if speeds else 1.0
+        
+        # ElevenLabs语速分布统计（范围：0.7-1.2）
+        speed_distribution = {
+            'slow': sum(1 for s in speeds if self.min_speech_rate <= s < 1.0),
+            'normal': sum(1 for s in speeds if 0.95 <= s <= 1.05),
+            'fast': sum(1 for s in speeds if 1.0 < s <= self.max_speech_rate)
+        }
+        
         report = f"""ElevenLabs TTS语音合成报告
 ========================
 
@@ -623,6 +683,16 @@ class ElevenLabsTTS:
   - 使用模型: {self.model_id}
   - 稳定性: {self.stability}
   - 相似度增强: {self.similarity_boost}
+
+语速信息:
+  - 支持范围: {self.min_speech_rate} - {self.max_speech_rate}
+  - 平均语速: {avg_speed:.3f}
+  - 语速范围: {min_speed:.3f} - {max_speed:.3f}
+
+语速分布:
+  - 慢速 ({self.min_speech_rate}-1.0): {speed_distribution['slow']} 片段
+  - 正常 (0.95-1.05): {speed_distribution['normal']} 片段
+  - 快速 (1.0-{self.max_speech_rate}): {speed_distribution['fast']} 片段
 """
         
         return report

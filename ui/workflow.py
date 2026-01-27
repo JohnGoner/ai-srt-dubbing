@@ -270,9 +270,6 @@ class WorkflowManager:
             # 创建文本优化器
             text_optimizer = TextOptimizer(config)
             
-            # 检查TTS是否支持语速调整
-            supports_speech_rate = selected_tts_service != 'elevenlabs'
-            
             # 定义回调函数
             def on_segment_complete(segment_id: str, segment: SegmentDTO):
                 """单个片段完成回调"""
@@ -294,7 +291,6 @@ class WorkflowManager:
                 target_language=target_language,
                 voice_name=voice_name,
                 text_optimizer=text_optimizer,
-                supports_speech_rate=supports_speech_rate,
                 on_segment_complete=on_segment_complete,
                 on_all_complete=on_all_complete
             )
@@ -431,9 +427,6 @@ class WorkflowManager:
             # 创建文本优化器
             text_optimizer = TextOptimizer(config)
             
-            # 检查TTS是否支持语速调整（ElevenLabs不支持）
-            supports_speech_rate = selected_tts_service != 'elevenlabs'
-            
             # 并发配置 - 根据TTS服务动态设置
             # MiniMax 有严格的 RPM 限制，需要较低的并发数
             if selected_tts_service == 'minimax':
@@ -441,7 +434,7 @@ class WorkflowManager:
             else:
                 max_workers = min(5, len(segments))  # 其他TTS服务最多5个并发worker
             
-            logger.info(f"开始并发生成 {len(segments)} 个片段的音频 (workers={max_workers}, TTS={selected_tts_service}, 语速调整: {'支持' if supports_speech_rate else '不支持'})")
+            logger.info(f"开始并发生成 {len(segments)} 个片段的音频 (workers={max_workers}, TTS={selected_tts_service})")
             
             # 进度显示
             progress_bar = st.progress(0)
@@ -456,8 +449,7 @@ class WorkflowManager:
                 # 每个线程创建自己的迭代优化器实例
                 thread_optimizer = AudioIterationOptimizer(
                     tts_engine=tts_engine,
-                    text_optimizer=text_optimizer,
-                    supports_speech_rate=supports_speech_rate
+                    text_optimizer=text_optimizer
                 )
                 
                 if not seg.final_text:
@@ -468,7 +460,7 @@ class WorkflowManager:
                 current_text = seg.final_text
                 original_text = seg.original_text or seg.translated_text or current_text
                 target_duration = seg.target_duration
-                initial_rate = seg.speech_rate or 1.0 if supports_speech_rate else 1.0
+                initial_rate = seg.speech_rate or 1.0
                 
                 # 如果目标时长太短，跳过迭代优化
                 if target_duration < 0.5:
