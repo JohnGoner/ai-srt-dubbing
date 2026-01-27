@@ -144,10 +144,11 @@ class FirebaseStorageManager:
         segment_id: str,
         stage: str,
         audio_data: Union[bytes, BinaryIO, 'AudioSegment'],
-        content_type: str = 'audio/mpeg'
+        content_type: str = 'audio/mpeg',
+        max_retries: int = 3
     ) -> Optional[str]:
         """
-        上传分阶段音频到 Firebase Storage
+        上传分阶段音频到 Firebase Storage（带重试机制）
         
         Args:
             user_id: 用户 ID
@@ -156,6 +157,7 @@ class FirebaseStorageManager:
             stage: 阶段 ('preview' for Stage 1, 'confirmed' for Stage 2)
             audio_data: 音频数据
             content_type: MIME 类型
+            max_retries: 最大重试次数
             
         Returns:
             文件的存储路径，失败返回 None
@@ -163,6 +165,8 @@ class FirebaseStorageManager:
         if not self.is_connected:
             logger.error("Firebase Storage 未连接")
             return None
+        
+        import time
         
         try:
             # 处理不同类型的音频数据
@@ -180,13 +184,43 @@ class FirebaseStorageManager:
             
             storage_path = self._get_staged_audio_path(user_id, project_id, segment_id, stage)
             blob = self.bucket.blob(storage_path)
-            blob.upload_from_string(data, content_type=content_type)
             
-            logger.debug(f"分阶段音频上传成功: {storage_path} (stage={stage}, {len(data)} bytes)")
-            return storage_path
+            # 🔥 带重试的上传逻辑
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    blob.upload_from_string(data, content_type=content_type)
+                    logger.debug(f"分阶段音频上传成功: {storage_path} (stage={stage}, {len(data)} bytes)")
+                    return storage_path
+                except Exception as upload_error:
+                    last_error = upload_error
+                    error_str = str(upload_error).lower()
+                    
+                    # 检查是否是代理/网络错误
+                    is_network_error = any(keyword in error_str for keyword in [
+                        'proxy', 'connection', 'timeout', 'remotedisconnected', 
+                        'connectionreset', 'max retries'
+                    ])
+                    
+                    if is_network_error and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 递增等待: 2s, 4s, 6s
+                        logger.warning(f"上传失败(网络问题)，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {upload_error}")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+            
+            # 所有重试都失败
+            raise last_error
             
         except Exception as e:
-            logger.error(f"上传分阶段音频失败: {e}")
+            error_str = str(e).lower()
+            is_proxy_error = 'proxy' in error_str or 'remotedisconnected' in error_str
+            
+            if is_proxy_error:
+                # 代理错误：只记录警告，不阻塞用户操作
+                logger.warning(f"上传分阶段音频失败(代理问题，可忽略): {e}")
+            else:
+                logger.error(f"上传分阶段音频失败: {e}")
             return None
     
     def delete_staged_audio(

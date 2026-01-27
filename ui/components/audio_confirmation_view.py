@@ -1,6 +1,7 @@
 """
 音频确认视图组件
 纯组件，不直接操作session_state
+支持渐进式音频生成，用户可在部分片段完成后开始确认
 """
 
 import streamlit as st
@@ -10,6 +11,7 @@ from typing import List, Dict, Any
 from loguru import logger
 from models.segment_dto import SegmentDTO
 from translation.text_optimizer import TextOptimizer
+from utils.progressive_audio_generator import get_progressive_generator, SegmentStatus
 
 
 class AudioConfirmationView:
@@ -52,15 +54,38 @@ class AudioConfirmationView:
         return self._render_action_buttons(confirmation_segments, translated_original_segments, optimized_segments, target_lang)
 
     def _display_overall_stats_minimal(self, confirmation_segments: List[SegmentDTO]):
-        """显示极简统计信息"""
+        """显示极简统计信息 - 支持渐进式生成状态"""
         if not confirmation_segments:
             return
         
         total = len(confirmation_segments)
         confirmed = sum(1 for seg in confirmation_segments if seg.confirmed)
-        avg_error = sum(seg.timing_error_ms or 0 for seg in confirmation_segments) / total
         
-        st.caption(f"总片段: {total} | 已确认: {confirmed}/{total} | 平均误差: {avg_error:.0f}ms")
+        # 🔥 渐进式生成：检查生成状态
+        progressive_generator = get_progressive_generator()
+        is_generating = progressive_generator.is_running()
+        
+        if is_generating:
+            progress = progressive_generator.get_progress()
+            ready_count = progress.completed_segments
+            generating_count = progress.generating_segments
+            pending_count = progress.pending_segments
+            
+            # 显示生成进度
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.caption(f"🎵 音频生成中: {ready_count}/{total} 就绪 | 已确认: {confirmed}/{total}")
+            with col2:
+                if st.button("🔄 刷新", key="refresh_generation_status", help="刷新生成进度"):
+                    st.rerun()
+            
+            # 简洁的进度条
+            if total > 0:
+                st.progress(ready_count / total, text=f"正在生成 {generating_count} 个，等待 {pending_count} 个")
+        else:
+            # 常规统计
+            avg_error = sum(seg.timing_error_ms or 0 for seg in confirmation_segments) / total if total > 0 else 0
+            st.caption(f"总片段: {total} | 已确认: {confirmed}/{total} | 平均误差: {avg_error:.0f}ms")
     
     def _display_overall_stats(self, confirmation_segments: List[SegmentDTO]):
         """显示总体统计信息"""
@@ -449,12 +474,34 @@ class AudioConfirmationView:
     
     
     def _display_audio_preview(self, segment: SegmentDTO, segment_index: int):
-        """显示音频预览"""
+        """显示音频预览 - 支持渐进式生成状态"""
         st.markdown("### 🎵 音频预览")
         
-        # 调试：显示片段的音频状态
+        # 🔥 优先检查片段是否已有音频数据（从 Firebase 加载的工程可能已有音频）
         has_audio_data = segment.audio_data is not None
         has_audio_path = bool(segment.audio_path)
+        
+        # 如果片段已有音频数据或路径，跳过 progressive_generator 状态检查
+        if not has_audio_data and not has_audio_path:
+            # 🔥 渐进式生成：检查片段的生成状态
+            progressive_generator = get_progressive_generator()
+            segment_status = progressive_generator.get_segment_status(segment.id)
+            
+            # 如果片段正在生成或等待生成，显示状态
+            if segment_status == SegmentStatus.GENERATING:
+                st.info("⏳ 音频正在生成中...")
+                if st.button("🔄 刷新查看", key=f"refresh_segment_{segment_index}"):
+                    st.rerun()
+                return
+            elif segment_status == SegmentStatus.PENDING:
+                st.warning("⏸️ 音频等待生成中，请稍后刷新或先处理其他已就绪的片段")
+                if st.button("🔄 刷新查看", key=f"refresh_pending_{segment_index}"):
+                    st.rerun()
+                return
+            elif segment_status == SegmentStatus.FAILED:
+                st.error("❌ 音频生成失败，请点击「重新生成」按钮重试")
+        
+        # 调试：显示片段的音频状态
         logger.debug(f"_display_audio_preview: 片段 {segment.id}, audio_data={has_audio_data}, audio_path={has_audio_path}, path={segment.audio_path}")
         
         # 显示音频处理信息

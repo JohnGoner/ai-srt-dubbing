@@ -115,7 +115,8 @@ class TextOptimizer:
                 target_language,
                 duration_diff_ms,
                 action,
-                adjustment_type
+                adjustment_type,
+                force=force
             )
             
             if optimized_text and optimized_text != current_text:
@@ -138,7 +139,8 @@ class TextOptimizer:
         target_language: str,
         duration_diff_ms: float,
         action: str,
-        adjustment_type: str
+        adjustment_type: str,
+        force: bool = False
     ) -> Optional[str]:
         """
         渐进式最小修改策略
@@ -151,6 +153,7 @@ class TextOptimizer:
             duration_diff_ms: 时长差距(ms)
             action: 动作（缩短/延长）
             adjustment_type: 调整类型（删减/增加）
+            force: 是否强制激进优化
             
         Returns:
             优化后的文本
@@ -165,17 +168,30 @@ class TextOptimizer:
             target_language
         )
         
-        # 传给LLM的比例打4折，避免过度修改
-        llm_percentage = adjustment_percentage * 0.4
-        llm_estimated_words = max(1, int(current_word_count * llm_percentage / 100 + 0.5))
+        # 根据时长差距决定修改力度（越大越激进）
+        diff_ms = abs(duration_diff_ms)
         
-        # 单次最多修改3词（渐进式策略）
-        target_change_words = max(1, min(llm_estimated_words, 3))
+        if diff_ms > 5000:  # >5秒：非常激进
+            discount = 0.9
+            max_change = 10
+        elif diff_ms > 3000:  # 3-5秒：较激进  
+            discount = 0.8
+            max_change = 8
+        elif diff_ms > 1500:  # 1.5-3秒：中等
+            discount = 0.6
+            max_change = 5
+        else:  # <1.5秒：保守
+            discount = 0.4
+            max_change = 3
+        
+        llm_percentage = adjustment_percentage * discount
+        llm_estimated_words = max(1, int(current_word_count * llm_percentage / 100 + 0.5))
+        target_change_words = max(1, min(llm_estimated_words, max_change))
         
         logger.info(f"渐进式优化: 需要{action}{abs(duration_diff_ms):.0f}ms, "
                    f"当前{current_word_count}词, 本轮目标{action}{target_change_words}词")
         
-        # 使用比例控制的prompt（传入打折后的比例给LLM，原始比例用于验证）
+        # 传入target_change_words（已经限制过的词数）
         optimized_text = self._call_llm_with_ratio_control(
             original_text,
             current_text,
@@ -183,10 +199,10 @@ class TextOptimizer:
             action, 
             adjustment_type,
             llm_percentage,
-            llm_estimated_words,
+            target_change_words,  # 修复：传入限制后的词数
             duration_diff_ms,
-            actual_percentage=adjustment_percentage,       # 原始比例用于验证
-            actual_estimated_words=estimated_words         # 原始词数用于验证
+            actual_percentage=adjustment_percentage,
+            actual_estimated_words=estimated_words
         )
         
         return optimized_text
@@ -273,56 +289,52 @@ class TextOptimizer:
         language_name = self.language_names.get(target_language, target_language.upper())
         current_word_count = len(current_text.split())
         
-        # 关键改进：限制单次修改的词数，避免过度修改
-        # 单次最多修改3个词，确保渐进式调整
-        target_change_words = max(1, min(llm_estimated_words, 3))
+        # 使用上层传入的词数（不再重新计算，避免覆盖）
+        target_change_words = llm_estimated_words
         
-        # 构建精确词数控制的prompt（不再使用百分比，而是明确词数）
+        # 计算当前文本字符数（用于音节估算）
+        current_char_count = len(current_text.replace(' ', ''))
+        
+        # 构建严格词数控制的prompt（核心：精确控制修改幅度）
         if action == "缩短":
             target_word_count = max(1, current_word_count - target_change_words)
             
-            system_prompt = f"""你是一个精确的{language_name}文本微调专家。
+            system_prompt = f"""你是精确的{language_name}微编辑器。严格遵守词数限制！
 
-【核心原则】
-- 只做最小必要的修改，绝不重写整个句子
-- 保持原句的结构和大部分词汇不变
-- 只删除指定数量的词
-- 直接输出结果，不要任何解释"""
+规则：
+1. 只能删除 {target_change_words} 个词，不能多删
+2. 保持句子主体结构完全不变
+3. 直接输出结果，无解释"""
 
-            user_prompt = f"""任务：精确删除 {target_change_words} 个词
+            user_prompt = f"""输入（{current_word_count}词）: "{current_text}"
 
-当前文本（{current_word_count}词）: "{current_text}"
+任务：删除恰好 {target_change_words} 个词
+目标：{target_word_count} 词
 
-【约束】
-- 只删除 {target_change_words} 个不重要的词（如副词、修饰词、语气词）
-- 目标词数: {target_word_count} 词
-- 保持句子的主干和核心意思完全不变
-- 不要重构或改写句子
+删除优先级：副词 > 形容词 > 介词短语
+禁止：重写句子、改变句式、删除主语谓语宾语
 
-直接返回修改后的{language_name}文本:"""
+输出（必须 {target_word_count} 词）:"""
         else:
             target_word_count = current_word_count + target_change_words
             
-            system_prompt = f"""你是一个精确的{language_name}文本微调专家。
+            system_prompt = f"""你是精确的{language_name}微编辑器。严格遵守词数限制！
 
-【核心原则】
-- 只做最小必要的修改，绝不重写整个句子
-- 保持原句的结构和大部分词汇不变
-- 只添加指定数量的词
-- 直接输出结果，不要任何解释"""
+规则：
+1. 只能添加 {target_change_words} 个词，不能多加
+2. 保持句子主体结构完全不变
+3. 直接输出结果，无解释"""
 
-            user_prompt = f"""任务：精确添加 {target_change_words} 个词
+            user_prompt = f"""输入（{current_word_count}词）: "{current_text}"
+参考原意: "{original_text}"
 
-当前文本（{current_word_count}词）: "{current_text}"
-原始含义参考: "{original_text}"
+任务：添加恰好 {target_change_words} 个词
+目标：{target_word_count} 词
 
-【约束】
-- 只添加 {target_change_words} 个适当的词（如副词、修饰词）
-- 目标词数: {target_word_count} 词
-- 保持句子的主干结构不变
-- 不要重构或改写句子
+添加方式：插入副词/形容词修饰现有词
+禁止：重写句子、改变句式
 
-直接返回修改后的{language_name}文本:"""
+输出（必须 {target_word_count} 词）:"""
 
         try:
             logger.debug(f"LLM调用: {action}{target_change_words}词, 目标{target_word_count}词")

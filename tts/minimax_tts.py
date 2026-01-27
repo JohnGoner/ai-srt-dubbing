@@ -4,6 +4,7 @@ MiniMax TTS模块 - 支持循环逼近算法的精确语速控制
 """
 
 import requests
+from requests.adapters import HTTPAdapter
 from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
 import tempfile
@@ -15,6 +16,13 @@ import threading
 from datetime import datetime, timedelta
 import base64
 import json
+
+# 🔥 尝试导入 certifi，用于稳定的 SSL 证书
+try:
+    import certifi
+    SSL_VERIFY = certifi.where()
+except ImportError:
+    SSL_VERIFY = True  # 回退到系统证书
 
 
 class MinimaxTTS:
@@ -33,7 +41,7 @@ class MinimaxTTS:
         # 获取MiniMax API配置
         self.api_key = api_keys.get('minimax_api_key')
         self.group_id = api_keys.get('minimax_group_id')
-        self.base_url = api_keys.get('minimax_base_url', 'https://api.minimax.chat/v1')
+        self.base_url = api_keys.get('minimax_base_url', 'https://api.minimaxi.com/v1')
         
         if not self.api_key:
             raise ValueError("未配置MiniMax API密钥")
@@ -70,23 +78,27 @@ class MinimaxTTS:
         self.minor_pause_duration = pause_config.get('minor_pause_duration', 0.18)  # 逗号、分号、冒号停顿（秒）
         self.custom_pause_multiplier = pause_config.get('pause_multiplier', 1.0)    # 整体停顿倍率调节
         
-        # 请求频率控制 - 更保守的设置
+        # 请求频率控制 - 更保守的设置，避免 rate limit
         self.request_lock = threading.Lock()
         self.last_request_time = datetime.now()
-        self.min_request_interval = 0.5  # 每个请求之间最小间隔500ms（更保守）
+        self.min_request_interval = 1.5  # 每个请求之间最小间隔1.5秒（更保守）
         self.request_count = 0
         self.rate_limit_reset_time = datetime.now()
-        self.max_requests_per_minute = 40  # 每分钟最大请求数（更保守）
+        self.max_requests_per_minute = 20  # 每分钟最大请求数（MiniMax 限制较严格）
         
-        # 并发控制相关 - 降低并发数避免429错误
+        # 并发控制相关 - 降低并发数避免 rate limit 错误
         self.concurrent_requests = 0  # 当前并发请求数
-        self.max_concurrent_requests = 3  # 最大并发请求数（更保守）
+        self.max_concurrent_requests = 2  # 最大并发请求数（更保守，避免 RPM 限制）
         
         # 错误恢复相关
         self.consecutive_errors = 0
         self.max_consecutive_errors = 3
-        self.error_cooldown_time = 5  # 连续错误后的冷却时间（秒）
+        self.error_cooldown_time = 10  # 连续错误后的冷却时间（秒）- 增加到10秒
         self.last_error_time = None
+        
+        # Rate limit 专用冷却
+        self.rate_limit_hit_time = None
+        self.rate_limit_cooldown = 30  # rate limit 冷却时间（秒）
         
         # 成本跟踪
         self.api_call_count = 0
@@ -164,7 +176,7 @@ class MinimaxTTS:
     
     def _generate_audio_segments_concurrent(self, segments: List[Dict[str, Any]], voice_id: str, use_multi_candidate: bool = False) -> List[Dict[str, Any]]:
         """
-        并发生成音频片段
+        🔥 渐进式（顺序）生成音频片段 - 避免并发导致的 SSL/连接问题
         
         Args:
             segments: 片段列表
@@ -174,20 +186,12 @@ class MinimaxTTS:
         Returns:
             音频片段列表
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
-        
-        # 控制并发数，考虑API限制 - 更保守的设置
-        max_workers = min(self.max_concurrent_requests, len(segments), max(1, len(segments) // 6))
-        
-        results_lock = threading.Lock()
-        completed_count = 0
-        
         multi_candidate_info = "（多候选模式）" if use_multi_candidate else "（单次生成）"
-        logger.info(f"启动并发音频生成{multi_candidate_info}: {max_workers}个worker处理{len(segments)}个片段")
+        logger.info(f"启动渐进式音频生成{multi_candidate_info}: 顺序处理 {len(segments)} 个片段")
         
-        def generate_single_segment(segment: Dict, index: int) -> Tuple[int, Dict]:
-            """生成单个片段的音频"""
+        audio_segments = []
+        
+        for i, segment in enumerate(segments):
             try:
                 target_duration = segment.get('duration', 0)
                 text = segment['translated_text']
@@ -222,42 +226,18 @@ class MinimaxTTS:
                     'multi_candidate_used': use_multi_candidate and target_duration > 1.0
                 }
                 
-                return index, audio_segment
+                audio_segments.append(audio_segment)
+                logger.info(f"✅ 音频生成进度: {i + 1}/{len(segments)} - 片段 {segment['id']}")
+                
+                # 🔥 请求间隔，避免触发 rate limit
+                if i < len(segments) - 1:
+                    time.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"并发生成片段 {segment['id']} 音频失败: {str(e)}")
+                logger.error(f"渐进式生成片段 {segment['id']} 音频失败: {str(e)}")
                 # 创建静音片段作为备选
                 audio_segment = self._create_silence_segment(segment)
-                return index, audio_segment
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务
-            future_to_index = {
-                executor.submit(generate_single_segment, segment, i): i
-                for i, segment in enumerate(segments)
-            }
-            
-            # 收集结果
-            indexed_results = {}
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    result_index, audio_segment = future.result()
-                    indexed_results[result_index] = audio_segment
-                    
-                    # 线程安全的进度报告
-                    with results_lock:
-                        completed_count += 1
-                        logger.info(f"音频生成进度: {completed_count}/{len(segments)}")
-                        
-                except Exception as e:
-                    logger.error(f"获取并发结果异常 {index}: {e}")
-                    # 创建错误片段
-                    error_segment = self._create_silence_segment(segments[index])
-                    indexed_results[index] = error_segment
-            
-            # 按原始顺序组织结果
-            audio_segments = [indexed_results[i] for i in range(len(segments))]
+                audio_segments.append(audio_segment)
         
         success_count = len([seg for seg in audio_segments if seg.get('audio_data') is not None])
         logger.info(f"并发音频生成完成: {success_count}/{len(segments)} 成功")
@@ -298,7 +278,8 @@ class MinimaxTTS:
                 # 发送请求
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "Connection": "close"  # 🔥 禁用 keep-alive，每次新连接
                 }
                 
                 # 根据官方文档，API端点格式应该是带GroupId参数的
@@ -306,23 +287,50 @@ class MinimaxTTS:
                     raise ValueError("MiniMax API需要group_id参数")
                 url = f"{self.base_url}/t2a_v2?GroupId={self.group_id}"
                 
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                # 🔥 使用独立 Session，避免连接复用导致的 SSL EOF
+                # 每次请求创建新连接，不读系统代理，使用 certifi 证书
+                with requests.Session() as session:
+                    session.trust_env = False  # 不读系统代理
+                    response = session.post(
+                        url, 
+                        headers=headers, 
+                        json=payload, 
+                        timeout=(10, 90),  # 连接超时10s，读取超时90s
+                        verify=SSL_VERIFY
+                    )
                 
                 if response.status_code == 200:
-                    # 成功，重置错误计数
-                    self.consecutive_errors = 0
-                    self.last_error_time = None
-                    
-                    # 释放并发计数
-                    self._release_rate_limit()
-                    
                     # 处理响应
                     try:
                         result = response.json()
                         logger.debug(f"MiniMax API响应结构: {list(result.keys())}")
                         
-                        # 根据官方示例，检查响应格式
-                        # 官方示例直接打印response.text，说明可能有不同的响应格式
+                        # 🔥 首先检查 MiniMax API 业务层错误（如 rate limit）
+                        # MiniMax 返回 HTTP 200 但 base_resp.status_code != 0 表示业务错误
+                        if 'base_resp' in result:
+                            base_resp = result['base_resp']
+                            status_code = base_resp.get('status_code', 0)
+                            status_msg = base_resp.get('status_msg', '')
+                            
+                            if status_code == 1002:  # rate limit exceeded
+                                self._release_rate_limit()
+                                self._handle_minimax_rate_limit(attempt, max_retries)
+                                if attempt < max_retries - 1:
+                                    continue
+                                else:
+                                    raise Exception(f"MiniMax rate limit exceeded: {status_msg}")
+                            
+                            if status_code != 0:
+                                self._release_rate_limit()
+                                raise Exception(f"MiniMax API业务错误 [{status_code}]: {status_msg}")
+                        
+                        # 成功，重置错误计数
+                        self.consecutive_errors = 0
+                        self.last_error_time = None
+                        self.rate_limit_hit_time = None  # 重置 rate limit 状态
+                    
+                        # 释放并发计数
+                        self._release_rate_limit()
                         
                         # 尝试多种可能的响应结构
                         audio_hex = None
@@ -436,10 +444,19 @@ class MinimaxTTS:
                 error_msg = f"生成单个音频失败 (第{attempt + 1}次尝试): {str(e)}"
                 logger.error(error_msg)
                 
-                # 处理429错误
                 error_str = str(e).lower()
+                
+                # 处理429错误
                 if '429' in error_str or 'too many requests' in error_str:
                     self._handle_rate_limit_error(attempt, max_retries)
+                    if attempt < max_retries - 1:
+                        continue
+                
+                # 🔥 处理 SSL/连接错误 - 增加重试等待时间
+                if any(keyword in error_str for keyword in ['ssl', 'connection', 'timeout', 'eof', 'reset']):
+                    wait_time = 3 * (attempt + 1)  # 渐进式等待: 3s, 6s, 9s
+                    logger.warning(f"SSL/连接错误，等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
                     if attempt < max_retries - 1:
                         continue
                 
@@ -467,7 +484,7 @@ class MinimaxTTS:
         rate = max(0.5, min(2.0, speech_rate))
         
         payload = {
-            "model": "speech-2.5-hd-preview",
+            "model": "speech-2.6-turbo",
             "text": text,
             "timbre_weights": [
                 {
@@ -862,46 +879,76 @@ class MinimaxTTS:
     def _wait_for_rate_limit(self):
         """
         等待满足请求频率限制 - 支持并发控制
+        修复死锁问题：将并发数检查移到锁外部，避免持有锁时等待
         """
+        # 🔥 首先检查是否在 rate limit 冷却期内
+        rate_limit_cooldown_wait = 0
+        with self.request_lock:
+            if self.rate_limit_hit_time:
+                cooldown_elapsed = (datetime.now() - self.rate_limit_hit_time).total_seconds()
+                if cooldown_elapsed < self.rate_limit_cooldown:
+                    rate_limit_cooldown_wait = self.rate_limit_cooldown - cooldown_elapsed
+        
+        if rate_limit_cooldown_wait > 0:
+            logger.warning(f"🔥 MiniMax rate limit 冷却期，等待 {rate_limit_cooldown_wait:.1f} 秒...")
+            time.sleep(rate_limit_cooldown_wait)
+        
+        # 在锁外等待并发数减少，避免死锁
+        wait_count = 0
+        while True:
+            with self.request_lock:
+                if self.concurrent_requests < self.max_concurrent_requests:
+                    break
+            # 在锁外等待，让其他线程有机会释放
+            if wait_count == 0:
+                logger.debug(f"达到最大并发数({self.max_concurrent_requests})，等待...")
+            wait_count += 1
+            time.sleep(0.2)  # 增加等待间隔
+        
+        # 检查是否需要等待每分钟请求限制重置
+        rate_limit_wait = 0
         with self.request_lock:
             current_time = datetime.now()
-            
-            # 检查并发数限制
-            while self.concurrent_requests >= self.max_concurrent_requests:
-                logger.debug(f"达到最大并发数({self.max_concurrent_requests})，等待...")
-                time.sleep(0.1)
-                current_time = datetime.now()
-            
-            # 重置分钟计数器
             if current_time - self.rate_limit_reset_time >= timedelta(minutes=1):
                 self.request_count = 0
                 self.rate_limit_reset_time = current_time
             
-            # 检查是否达到每分钟请求限制
             if self.request_count >= self.max_requests_per_minute:
-                wait_time = 60 - (current_time - self.rate_limit_reset_time).seconds
-                if wait_time > 0:
-                    logger.warning(f"达到每分钟请求限制，等待 {wait_time} 秒...")
-                    time.sleep(wait_time)
-                    self.request_count = 0
-                    self.rate_limit_reset_time = datetime.now()
-            
-            # 检查请求间隔
-            time_since_last = (current_time - self.last_request_time).total_seconds()
-            min_interval = self.min_request_interval / max(1, self.concurrent_requests)
-            if time_since_last < min_interval:
-                wait_time = min_interval - time_since_last
-                time.sleep(wait_time)
-            
-            # 检查是否在错误冷却期
+                rate_limit_wait = 60 - (current_time - self.rate_limit_reset_time).seconds
+        
+        # 在锁外等待每分钟限制重置
+        if rate_limit_wait > 0:
+            logger.warning(f"达到每分钟请求限制({self.max_requests_per_minute})，等待 {rate_limit_wait} 秒...")
+            time.sleep(rate_limit_wait)
+            with self.request_lock:
+                self.request_count = 0
+                self.rate_limit_reset_time = datetime.now()
+        
+        # 检查错误冷却期
+        error_cooldown_wait = 0
+        with self.request_lock:
             if (self.last_error_time and 
                 self.consecutive_errors >= self.max_consecutive_errors):
-                cooldown_elapsed = (current_time - self.last_error_time).total_seconds()
+                cooldown_elapsed = (datetime.now() - self.last_error_time).total_seconds()
                 if cooldown_elapsed < self.error_cooldown_time:
-                    wait_time = self.error_cooldown_time - cooldown_elapsed
-                    logger.warning(f"错误冷却期，等待 {wait_time:.1f} 秒...")
-                    time.sleep(wait_time)
-                    self.consecutive_errors = 0
+                    error_cooldown_wait = self.error_cooldown_time - cooldown_elapsed
+        
+        # 在锁外等待错误冷却期
+        if error_cooldown_wait > 0:
+            logger.warning(f"错误冷却期，等待 {error_cooldown_wait:.1f} 秒...")
+            time.sleep(error_cooldown_wait)
+            with self.request_lock:
+                self.consecutive_errors = 0
+        
+        # 最终更新计数器
+        with self.request_lock:
+            current_time = datetime.now()
+            
+            # 检查请求间隔 - 使用固定的最小间隔，不根据并发数动态调整
+            time_since_last = (current_time - self.last_request_time).total_seconds()
+            if time_since_last < self.min_request_interval:
+                wait_time = self.min_request_interval - time_since_last
+                time.sleep(wait_time)
             
             # 更新计数器
             self.concurrent_requests += 1
@@ -932,6 +979,27 @@ class MinimaxTTS:
         wait_time = base_wait + jitter
         
         logger.warning(f"遇到429错误，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
+        time.sleep(wait_time)
+    
+    def _handle_minimax_rate_limit(self, attempt: int, max_retries: int):
+        """
+        处理 MiniMax API 特有的 rate limit 错误 (status_code: 1002)
+        MiniMax 的 RPM 限制较严格，需要更长的等待时间
+        """
+        # 记录触发 rate limit 的时间
+        self.rate_limit_hit_time = datetime.now()
+        
+        # MiniMax rate limit 使用更长的指数退避
+        base_wait = 5 * (2 ** attempt)  # 5s, 10s, 20s...
+        jitter = 0.2 * base_wait  # 添加随机性
+        wait_time = min(base_wait + jitter, 60)  # 最长等待60秒
+        
+        # 重置请求计数，避免继续触发限制
+        with self.request_lock:
+            self.request_count = 0
+            self.rate_limit_reset_time = datetime.now()
+        
+        logger.warning(f"🔥 MiniMax rate limit exceeded (RPM)，等待 {wait_time:.1f} 秒后重试 (第{attempt + 1}/{max_retries}次)")
         time.sleep(wait_time)
 
     def update_calibration(self, language: str, estimated_duration: float, actual_duration: float):
@@ -1007,7 +1075,7 @@ class MinimaxTTS:
         num_candidates: int = 3
     ) -> AudioSegment:
         """
-        生成多个音频候选，选择时长最接近目标的
+        🔥 渐进式生成多个音频候选，选择时长最接近目标的（避免并发 SSL 问题）
         
         Args:
             text: 文本内容
@@ -1019,16 +1087,14 @@ class MinimaxTTS:
         Returns:
             最佳匹配的音频片段
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         candidates = []
         target_ms = target_duration * 1000
         overflow_threshold_ms = 100  # 超时阈值：超过目标100ms视为"超时"
         
-        logger.info(f"🎯 多候选TTS: {num_candidates}候选, 目标={target_duration:.2f}s")
+        logger.info(f"🎯 多候选TTS（顺序）: {num_candidates}候选, 目标={target_duration:.2f}s")
         
-        def generate_candidate(idx: int) -> Tuple[int, Optional[AudioSegment], float, bool]:
-            """生成单个候选，返回(索引, 音频, 误差, 是否超时)"""
+        # 🔥 顺序生成候选，避免并发导致的 SSL 连接问题
+        for idx in range(num_candidates):
             try:
                 audio = self._generate_single_audio(text, voice_id, speech_rate)
                 duration_ms = len(audio)
@@ -1036,21 +1102,14 @@ class MinimaxTTS:
                 is_overflow = duration_ms > target_ms + overflow_threshold_ms  # 超过目标+100ms
                 status = "⚠️超时" if is_overflow else "✓"
                 logger.debug(f"  候选#{idx+1}: {duration_ms/1000:.2f}s, 误差{error:.0f}ms {status}")
-                return idx, audio, error, is_overflow
+                candidates.append((audio, error, idx, is_overflow))
+                
+                # 请求间隔
+                if idx < num_candidates - 1:
+                    time.sleep(0.3)
+                    
             except Exception as e:
                 logger.warning(f"  候选#{idx+1}失败: {e}")
-                return idx, None, float('inf'), True
-        
-        # 并发生成候选（控制并发数，避免API限制）
-        max_workers = min(num_candidates, 2)
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(generate_candidate, i) for i in range(num_candidates)]
-            
-            for future in as_completed(futures):
-                idx, audio, error, is_overflow = future.result()
-                if audio is not None:
-                    candidates.append((audio, error, idx, is_overflow))
         
         if not candidates:
             logger.error("多候选全部失败，使用静音")

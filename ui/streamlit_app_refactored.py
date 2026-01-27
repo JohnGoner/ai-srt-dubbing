@@ -16,6 +16,43 @@ import time
 # 添加项目根目录到Python路径
 sys.path.append(str(Path(__file__).parent.parent))
 
+
+def _setup_network_config():
+    """
+    设置网络配置（代理绕过等）
+    在应用启动时调用，仅执行一次
+    """
+    if st.session_state.get('_network_configured', False):
+        return
+    
+    try:
+        from utils.config_manager import get_global_config_manager
+        config_manager = get_global_config_manager()
+        config = config_manager.load_config()
+        
+        if config:
+            network_config = config.get('network', {})
+            bypass_proxy = network_config.get('bypass_proxy', False)
+            
+            if bypass_proxy:
+                # 清除代理环境变量，让 requests/urllib 直连
+                proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 
+                             'NO_PROXY', 'no_proxy', 'ALL_PROXY', 'all_proxy']
+                for var in proxy_vars:
+                    if var in os.environ:
+                        del os.environ[var]
+                
+                # 设置 NO_PROXY 为 * 以确保所有请求直连
+                os.environ['NO_PROXY'] = '*'
+                os.environ['no_proxy'] = '*'
+                
+                logger.info("已启用代理绕过模式，Firebase Storage 将使用直连")
+        
+        st.session_state['_network_configured'] = True
+        
+    except Exception as e:
+        logger.warning(f"设置网络配置失败: {e}")
+
 from models.segment_dto import SegmentDTO
 from models.project_dto import ProjectDTO
 from ui.workflow import WorkflowManager
@@ -668,6 +705,81 @@ def _get_client_ip() -> str:
         return "unknown"
 
 
+def _show_save_project_button():
+    """显示保存工程按钮"""
+    try:
+        current_project = st.session_state.get('current_project')
+        
+        # 如果没有当前工程，不显示保存按钮
+        if not current_project:
+            return
+        
+        # 获取存储配置
+        config = st.session_state.get('config', {})
+        storage_config = config.get('storage', {})
+        storage_backend = storage_config.get('backend', 'local')
+        
+        # 根据存储后端显示不同的图标和文字
+        if storage_backend == 'firebase':
+            save_icon = "☁️"
+            save_text = "保存到云端"
+            save_help = "将当前工程保存到 Firebase 云端存储"
+        else:
+            save_icon = "💾"
+            save_text = "保存到本地"
+            save_help = "将当前工程保存到本地存储"
+        
+        st.sidebar.markdown("### 💾 工程保存")
+        
+        # 显示当前存储模式
+        storage_mode_text = "云端" if storage_backend == 'firebase' else "本地"
+        st.sidebar.caption(f"存储模式: {storage_mode_text}")
+        
+        # 保存按钮
+        if st.sidebar.button(f"{save_icon} {save_text}", key="save_project_btn", help=save_help, use_container_width=True):
+            _execute_save_project(current_project, storage_backend)
+        
+    except Exception as e:
+        logger.warning(f"显示保存按钮失败: {e}")
+
+
+def _execute_save_project(project, storage_backend: str):
+    """执行工程保存操作"""
+    try:
+        from models.project_dto import ProjectDTO
+        
+        if not isinstance(project, ProjectDTO):
+            st.sidebar.error("❌ 无效的工程对象")
+            return
+        
+        # 获取当前会话数据
+        session_data = get_session_data()
+        
+        # 获取工程集成实例
+        project_integration = get_user_project_integration()
+        
+        # 执行保存
+        with st.sidebar:
+            with st.spinner("正在保存..."):
+                success = project_integration.save_project_state(project, session_data)
+                
+                # 如果是 Firebase 后端，确保刷新待保存的数据
+                if storage_backend == 'firebase':
+                    project_integration.flush_pending_saves()
+        
+        if success:
+            storage_text = "云端" if storage_backend == 'firebase' else "本地"
+            st.sidebar.success(f"✅ 工程已保存到{storage_text}")
+            logger.info(f"手动保存工程成功: {project.name} -> {storage_backend}")
+        else:
+            st.sidebar.error("❌ 保存失败，请重试")
+            logger.error(f"手动保存工程失败: {project.name}")
+            
+    except Exception as e:
+        st.sidebar.error(f"❌ 保存出错: {str(e)}")
+        logger.error(f"保存工程时发生错误: {e}")
+
+
 def _show_progress_indicator():
     """显示当前工程进度指示器 - 极简版"""
     try:
@@ -688,15 +800,6 @@ def _show_progress_indicator():
         if current_project:
             project_name = getattr(current_project, 'name', '未知工程')
             st.sidebar.caption(f"当前工程: {project_name}")
-        
-        # 显示访问信息
-        with st.sidebar.expander("🌐 共享与访问"):
-            import socket
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            st.write(f"**局域网访问:**")
-            st.code(f"http://{local_ip}:8501")
-            st.caption("外地同事请使用启动脚本中显示的 .trycloudflare.com 链接")
         
         # 极简进度条
         stage_keys = [step[0] for step in workflow_steps]
@@ -768,6 +871,9 @@ def clean_project_name(filename: str) -> str:
 
 def main():
     """主应用程序 - 纯状态机调度器"""
+    
+    # 🔥 网络配置（代理绕过等）- 在所有网络请求之前设置
+    _setup_network_config()
     
     # 🔥 关键修复：st.set_page_config() 必须是第一个 Streamlit 命令
     # 在任何认证检查之前调用，避免注销后的配置冲突
@@ -1042,6 +1148,11 @@ def main():
         
         st.markdown("---")
         
+        # 保存工程按钮
+        _show_save_project_button()
+        
+        st.markdown("---")
+        
         # 显示当前工程进度
         _show_progress_indicator()
     
@@ -1083,7 +1194,7 @@ def main():
         
         # 如果状态发生了变化，需要rerun来显示新的阶段
         if updated_session_data.get('processing_stage') != processing_stage:
-            logger.info(f"🔄 状态转换: {processing_stage} → {updated_session_data.get('processing_stage')}")
+            logger.info(f"状态转换: {processing_stage} → {updated_session_data.get('processing_stage')}")
             st.rerun()
 
 

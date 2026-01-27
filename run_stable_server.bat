@@ -9,6 +9,14 @@ echo.
 :: 设置 Python 环境路径
 set PY="C:\ProgramData\miniconda3\envs\aidubbing\python.exe"
 
+:: 0. 清理旧进程（自动杀掉占用8501端口的进程）
+echo [0/2] Cleaning up old processes on port 8501...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING"') do (
+    echo Killing process %%a...
+    taskkill /PID %%a /F >nul 2>&1
+)
+timeout /t 2 /nobreak > nul
+
 :: 1. 启动 Streamlit
 echo [1/2] Starting Streamlit service...
 start "AI-Dubbing" /min cmd /c "%PY% -m streamlit run ui/streamlit_app_refactored.py --server.port 8501 --server.address 0.0.0.0"

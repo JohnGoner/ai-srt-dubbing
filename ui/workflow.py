@@ -19,6 +19,12 @@ from ui.components.language_selection_view import LanguageSelectionView
 from ui.components.audio_confirmation_view import AudioConfirmationView
 from ui.components.completion_view import CompletionView
 from utils.project_integration import get_project_integration
+from utils.progressive_audio_generator import (
+    get_progressive_generator, 
+    reset_progressive_generator,
+    GenerationProgress,
+    SegmentStatus
+)
 
 
 def _get_current_user_id() -> str:
@@ -219,6 +225,168 @@ class WorkflowManager:
             logger.warning(f"按需下载片段 {segment.id} 音频失败: {e}")
             return False
     
+    def _start_progressive_audio_generation(self, segments: List[SegmentDTO], target_language: str, session_data: Dict[str, Any]):
+        """
+        启动渐进式音频生成
+        
+        用户可以在部分片段生成完成后提前进入确认阶段，提高工作效率
+        """
+        try:
+            from tts import create_tts_engine
+            from translation.text_optimizer import TextOptimizer
+            
+            # 获取用户选择的TTS服务
+            selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
+            selected_voice_id = st.session_state.get('selected_voice_id')
+            config = st.session_state.get('config', self.config)
+            
+            # 创建或获取TTS引擎
+            tts_engine = st.session_state.get('tts_instance')
+            current_service = st.session_state.get('current_tts_service')
+            
+            if not tts_engine or current_service != selected_tts_service:
+                logger.info(f"创建TTS引擎: {selected_tts_service}")
+                tts_engine = create_tts_engine(config, selected_tts_service)
+                st.session_state['tts_instance'] = tts_engine
+                st.session_state['current_tts_service'] = selected_tts_service
+            
+            # 如果用户选择了特定音色，设置它
+            if selected_voice_id:
+                tts_engine.set_voice(selected_voice_id)
+            
+            # 获取音色名称
+            if selected_tts_service == 'elevenlabs' and selected_voice_id:
+                voice_name = selected_voice_id
+            else:
+                voice_name = tts_engine.voice_map.get(target_language) if hasattr(tts_engine, 'voice_map') else None
+                if isinstance(voice_name, dict):
+                    voice_name = list(voice_name.keys())[0] if voice_name else None
+            
+            if not voice_name:
+                logger.warning(f"未配置语言 {target_language} 的音色")
+                st.warning(f"⚠️ 未配置语言 {target_language} 的音色，请检查配置")
+                return
+            
+            # 创建文本优化器
+            text_optimizer = TextOptimizer(config)
+            
+            # 检查TTS是否支持语速调整
+            supports_speech_rate = selected_tts_service != 'elevenlabs'
+            
+            # 定义回调函数
+            def on_segment_complete(segment_id: str, segment: SegmentDTO):
+                """单个片段完成回调"""
+                logger.debug(f"片段 {segment_id} 生成完成，质量: {segment.quality}")
+                # 异步上传预览音频
+                if segment.audio_data is not None:
+                    self._upload_single_preview_audio(segment, session_data)
+            
+            def on_all_complete():
+                """全部完成回调"""
+                logger.info("渐进式音频生成全部完成")
+                st.session_state['progressive_generation_complete'] = True
+            
+            # 重置并启动渐进式生成器
+            progressive_generator = reset_progressive_generator()
+            success = progressive_generator.start_generation(
+                segments=segments,
+                tts_engine=tts_engine,
+                target_language=target_language,
+                voice_name=voice_name,
+                text_optimizer=text_optimizer,
+                supports_speech_rate=supports_speech_rate,
+                on_segment_complete=on_segment_complete,
+                on_all_complete=on_all_complete
+            )
+            
+            if success:
+                logger.info(f"渐进式音频生成已启动，共 {len(segments)} 个片段")
+                st.session_state['progressive_generation_started'] = True
+            else:
+                logger.error("启动渐进式音频生成失败")
+                st.error("❌ 启动音频生成失败，请重试")
+                
+        except Exception as e:
+            logger.error(f"启动渐进式音频生成失败: {e}")
+            st.error(f"❌ 启动音频生成失败: {str(e)}")
+    
+    def _upload_single_preview_audio(self, segment: SegmentDTO, session_data: Dict[str, Any]):
+        """异步上传单个片段的预览音频"""
+        try:
+            current_project = session_data.get('current_project')
+            if not current_project:
+                return
+            
+            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
+                return
+            
+            user_id = getattr(current_project, 'owner_id', '')
+            project_id = getattr(current_project, 'id', '')
+            
+            if not user_id or not project_id or segment.audio_data is None:
+                return
+            
+            from utils.firebase_storage import get_storage_manager
+            from utils.async_upload_manager import get_upload_manager
+            
+            storage = get_storage_manager()
+            if not storage.is_connected:
+                return
+            
+            upload_manager = get_upload_manager()
+            upload_manager.submit_preview_upload(
+                user_id=user_id,
+                project_id=project_id,
+                segment_id=segment.id,
+                audio_data=segment.audio_data
+            )
+            
+            # 预先设置预览路径
+            preview_key = f"{segment.id}_preview"
+            expected_path = f"users/{user_id}/projects/{project_id}/audio/preview/{segment.id}.mp3"
+            current_project.update_audio_storage_path(preview_key, expected_path)
+            
+        except Exception as e:
+            logger.warning(f"上传预览音频失败 [{segment.id}]: {e}")
+    
+    def _render_generation_progress(self, progress: GenerationProgress, segments: List[SegmentDTO]):
+        """渲染渐进式生成进度"""
+        # 创建进度显示区域
+        progress_container = st.container()
+        
+        with progress_container:
+            # 主进度条
+            progress_pct = progress.progress_percentage / 100
+            st.progress(progress_pct, text=f"🎵 音频生成中: {progress.completed_segments}/{progress.total_segments}")
+            
+            # 详细状态信息
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("已完成", f"{progress.completed_segments}")
+            
+            with col2:
+                st.metric("生成中", f"{progress.generating_segments}")
+            
+            with col3:
+                st.metric("待处理", f"{progress.pending_segments}")
+            
+            with col4:
+                if progress.estimated_remaining_seconds > 0:
+                    remaining_min = int(progress.estimated_remaining_seconds // 60)
+                    remaining_sec = int(progress.estimated_remaining_seconds % 60)
+                    st.metric("预计剩余", f"{remaining_min}分{remaining_sec}秒")
+                else:
+                    st.metric("预计剩余", "计算中...")
+            
+            # 如果可以开始确认，显示提示
+            if progress.can_start_confirmation and not progress.is_complete:
+                st.success(f"✅ 已有 {progress.completed_segments} 个片段可供确认！后台继续生成剩余 {progress.pending_segments + progress.generating_segments} 个片段...")
+            
+            # 显示失败的片段（如果有）
+            if progress.failed_segments > 0:
+                st.warning(f"⚠️ {progress.failed_segments} 个片段生成失败，可在确认阶段重新生成")
+    
     def _generate_audio_for_segments(self, segments: List[SegmentDTO], target_language: str) -> List[SegmentDTO]:
         """为翻译段生成音频并进行智能迭代优化（并发版本，使用公共迭代优化器）"""
         try:
@@ -266,10 +434,14 @@ class WorkflowManager:
             # 检查TTS是否支持语速调整（ElevenLabs不支持）
             supports_speech_rate = selected_tts_service != 'elevenlabs'
             
-            # 并发配置
-            max_workers = min(5, len(segments))  # 最多5个并发worker
+            # 并发配置 - 根据TTS服务动态设置
+            # MiniMax 有严格的 RPM 限制，需要较低的并发数
+            if selected_tts_service == 'minimax':
+                max_workers = min(2, len(segments))  # MiniMax 最多2个并发worker
+            else:
+                max_workers = min(5, len(segments))  # 其他TTS服务最多5个并发worker
             
-            logger.info(f"开始并发生成 {len(segments)} 个片段的音频 (workers={max_workers}, 语速调整: {'支持' if supports_speech_rate else '不支持'})")
+            logger.info(f"开始并发生成 {len(segments)} 个片段的音频 (workers={max_workers}, TTS={selected_tts_service}, 语速调整: {'支持' if supports_speech_rate else '不支持'})")
             
             # 进度显示
             progress_bar = st.progress(0)
@@ -1081,7 +1253,7 @@ class WorkflowManager:
         return session_data
     
     def _render_audio_confirmation(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
-        """渲染音频确认界面"""
+        """渲染音频确认界面 - 支持渐进式生成"""
         # 支持新的翻译流程（直接来自翻译）和旧的优化流程
         translated_segments = session_data.get('translated_segments', [])
         optimized_segments = session_data.get('optimized_segments', [])
@@ -1105,6 +1277,11 @@ class WorkflowManager:
                 if available_count > 0:
                     has_cloud_audio = True
         
+        # 🔥 渐进式生成：检查是否有后台生成任务正在运行
+        progressive_generator = get_progressive_generator()
+        is_generating = progressive_generator.is_running()
+        generation_progress = progressive_generator.get_progress() if is_generating else None
+        
         # 如果有翻译数据但没有优化数据，直接使用翻译数据
         if translated_segments and not optimized_segments:
             logger.debug("使用直接翻译数据进行音频确认")
@@ -1114,8 +1291,38 @@ class WorkflowManager:
             has_audio_path = any(seg.audio_path for seg in translated_segments)
             
             if not has_memory_audio and not has_audio_path and not has_cloud_audio:
-                logger.info("开始为翻译段生成音频...")
-                translated_segments = self._generate_audio_for_segments(translated_segments, target_lang)
+                # 🔥 渐进式生成：如果还没有启动后台生成，启动它
+                if not is_generating:
+                    logger.info("启动渐进式音频生成...")
+                    self._start_progressive_audio_generation(translated_segments, target_lang, session_data)
+                    is_generating = True
+                    generation_progress = progressive_generator.get_progress()
+                
+                # 🔥 渐进式生成：显示生成进度，但允许用户提前进入确认界面
+                if is_generating and generation_progress:
+                    self._render_generation_progress(generation_progress, translated_segments)
+                    
+                    # 如果已经有足够的片段完成，继续显示确认界面
+                    if not generation_progress.can_start_confirmation:
+                        # 还没有足够的片段，显示等待界面
+                        st.info(f"⏳ 正在生成音频，请稍候... ({generation_progress.completed_segments}/{generation_progress.total_segments})")
+                        
+                        # 添加刷新按钮和自动刷新选项
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            if st.button("🔄 刷新进度", key="refresh_progress"):
+                                st.rerun()
+                        with col2:
+                            # 自动刷新（每5秒）
+                            auto_refresh = st.checkbox("🔁 自动刷新 (5秒)", value=True, key="auto_refresh_progress")
+                        
+                        if auto_refresh:
+                            import time
+                            time.sleep(5)
+                            st.rerun()
+                        
+                        return session_data
+                
                 # 确保TTS实例在session_data中也保存
                 if 'tts_instance' in st.session_state:
                     session_data['tts_instance'] = st.session_state['tts_instance']

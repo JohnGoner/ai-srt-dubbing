@@ -30,23 +30,27 @@ class WindowsAudioUtils:
         
         logger.debug(f"Windows音频工具初始化完成: {self.temp_base_dir}")
     
-    def create_temp_audio_path(self, prefix: str = "audio", segment_id: str = "") -> Path:
+    def create_temp_audio_path(self, prefix: str = "audio", segment_id: str = "", ext: str = "wav") -> Path:
         """
         创建临时音频文件路径
         
         Args:
             prefix: 文件名前缀
             segment_id: 片段ID
+            ext: 文件扩展名（不含点），默认wav，支持mp3等
             
         Returns:
             临时文件路径
         """
         timestamp = int(time.time() * 1000000)  # 微秒级时间戳
         
+        # 确保ext不含点号
+        ext = ext.lstrip('.')
+        
         if segment_id:
-            filename = f"{prefix}_{segment_id}_{timestamp}.wav"
+            filename = f"{prefix}_{segment_id}_{timestamp}.{ext}"
         else:
-            filename = f"{prefix}_{timestamp}.wav"
+            filename = f"{prefix}_{timestamp}.{ext}"
         
         return self.audio_temp_dir / filename
     
@@ -71,23 +75,37 @@ class WindowsAudioUtils:
         Args:
             audio_segment: pydub AudioSegment对象
             file_path: 目标文件路径
-            format: 音频格式
+            format: 音频格式（wav, mp3 等）
             
         Returns:
             是否导出成功
         """
         try:
-            # Windows系统使用标准的WAV参数
+            # Windows系统根据格式使用不同的编码参数
             if platform.system() == "Windows":
-                audio_segment.export(
-                    str(file_path), 
-                    format=format,
-                    parameters=[
-                        "-acodec", "pcm_s16le",  # 16-bit PCM编码
-                        "-ar", "44100",          # 44.1kHz采样率
-                        "-ac", "1"               # 单声道
-                    ]
-                )
+                if format.lower() == "mp3":
+                    # MP3 格式使用 libmp3lame 编码器
+                    audio_segment.export(
+                        str(file_path), 
+                        format=format,
+                        parameters=[
+                            "-acodec", "libmp3lame",  # MP3 编码器
+                            "-ar", "44100",           # 44.1kHz采样率
+                            "-ac", "1",               # 单声道
+                            "-b:a", "128k"            # 128kbps 比特率
+                        ]
+                    )
+                else:
+                    # WAV 等其他格式使用 PCM 编码
+                    audio_segment.export(
+                        str(file_path), 
+                        format=format,
+                        parameters=[
+                            "-acodec", "pcm_s16le",  # 16-bit PCM编码
+                            "-ar", "44100",          # 44.1kHz采样率
+                            "-ac", "1"               # 单声道
+                        ]
+                    )
             else:
                 # 非Windows系统使用原有逻辑
                 audio_segment.export(str(file_path), format=format)

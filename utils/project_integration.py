@@ -145,81 +145,83 @@ class ProjectIntegration:
             是否保存成功
         """
         try:
+            # 安全检查：确保 session_data 不为 None
+            if session_data is None:
+                logger.warning("session_data 为 None，跳过保存")
+                return False
+            
             # 从session_data更新工程状态
             processing_stage = session_data.get('processing_stage', 'file_upload')
+            
+            # 辅助函数：安全获取并转换片段列表
+            def safe_convert_segments(key: str) -> List:
+                """安全获取并转换片段列表，处理 None 值"""
+                segments = session_data.get(key)
+                if not segments:  # None 或空列表
+                    return []
+                return [
+                    seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
+                    for seg in segments
+                ]
             
             # 根据处理阶段更新工程数据
             if processing_stage == 'segmentation':
                 # 分段处理阶段
-                if 'segments' in session_data:
-                    project.segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['segments']
-                    ]
-                if 'segmented_segments' in session_data:
-                    project.segmented_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['segmented_segments']
-                    ]
+                segments = safe_convert_segments('segments')
+                if segments:
+                    project.segments = segments
+                segmented = safe_convert_segments('segmented_segments')
+                if segmented:
+                    project.segmented_segments = segmented
+                    
             elif processing_stage == 'confirm_segmentation':
                 # 确保原始片段数据也被保存
-                if 'segments' in session_data and not project.segments:
-                    project.segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['segments']
-                    ]
-                if 'segmented_segments' in session_data:
-                    project.segmented_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['segmented_segments']
-                    ]
-                if 'confirmed_segments' in session_data:
-                    project.confirmed_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['confirmed_segments']
-                    ]
+                if not project.segments:
+                    segments = safe_convert_segments('segments')
+                    if segments:
+                        project.segments = segments
+                segmented = safe_convert_segments('segmented_segments')
+                if segmented:
+                    project.segmented_segments = segmented
+                confirmed = safe_convert_segments('confirmed_segments')
+                if confirmed:
+                    project.confirmed_segments = confirmed
+                    
             elif processing_stage == 'language_selection':
                 # 确认分段阶段完成
-                if 'confirmed_segments' in session_data:
-                    project.confirmed_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['confirmed_segments']
-                    ]
+                confirmed = safe_convert_segments('confirmed_segments')
+                if confirmed:
+                    project.confirmed_segments = confirmed
+                    
             elif processing_stage == 'translating':
                 # 设置目标语言
                 if 'target_lang' in session_data:
                     project.target_language = session_data['target_lang']
+                    
             elif processing_stage == 'user_confirmation':
                 # 翻译阶段完成
-                if 'translated_segments' in session_data:
-                    project.translated_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['translated_segments']
-                    ]
-                if 'optimized_segments' in session_data:
-                    project.optimized_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['optimized_segments']
-                    ]
+                translated = safe_convert_segments('translated_segments')
+                if translated:
+                    project.translated_segments = translated
+                optimized = safe_convert_segments('optimized_segments')
+                if optimized:
+                    project.optimized_segments = optimized
                 # 🔥 关键修复：在音频确认阶段也保存 confirmation_segments 到 final_segments
                 # 这样每次用户确认单个片段后，音频数据和确认状态都会被保存到工程中
-                if 'confirmation_segments' in session_data and session_data['confirmation_segments']:
-                    project.final_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['confirmation_segments']
-                    ]
+                final = safe_convert_segments('confirmation_segments')
+                if final:
+                    project.final_segments = final
                     logger.debug(f"保存了 {len(project.final_segments)} 个确认片段到工程")
+                    
             elif processing_stage == 'completion':
                 # 用户确认阶段完成，保存最终结果
-                if 'confirmation_segments' in session_data:
-                    project.final_segments = [
-                        seg.to_legacy_dict() if isinstance(seg, SegmentDTO) else seg
-                        for seg in session_data['confirmation_segments']
-                    ]
+                final = safe_convert_segments('confirmation_segments')
+                if final:
+                    project.final_segments = final
                 
                 # 保存API使用统计
-                if 'completion_results' in session_data:
-                    completion_data = session_data['completion_results']
+                completion_data = session_data.get('completion_results')
+                if completion_data and isinstance(completion_data, dict):
                     if 'api_usage_summary' in completion_data:
                         project.add_api_usage('combined', completion_data['api_usage_summary'])
                     if 'stats' in completion_data:
