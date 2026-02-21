@@ -38,13 +38,30 @@ class MinimaxTTS:
         self.config = config
         api_keys = config.get('api_keys', {})
         
-        # 获取MiniMax API配置
-        self.api_key = api_keys.get('minimax_api_key')
+        # 获取MiniMax API配置 - 支持双 API Key（Coding Plan 优先）
+        self.coding_plan_key = api_keys.get('minimax_coding_plan_key', '')
+        self.pay_as_you_go_key = api_keys.get('minimax_api_key', '')
         self.group_id = api_keys.get('minimax_group_id')
         self.base_url = api_keys.get('minimax_base_url', 'https://api.minimaxi.com/v1')
         
+        # 当前使用的 API Key（优先 Coding Plan）
+        if self.coding_plan_key:
+            self._current_key_type = 'coding_plan'
+            self.api_key = self.coding_plan_key
+        else:
+            self._current_key_type = 'pay_as_you_go'
+            self.api_key = self.pay_as_you_go_key
+        
+        # Coding Plan 限额状态
+        self._coding_plan_exhausted = False
+        
         if not self.api_key:
-            raise ValueError("未配置MiniMax API密钥")
+            raise ValueError("未配置MiniMax API密钥（需要配置 minimax_coding_plan_key 或 minimax_api_key）")
+        
+        if self.coding_plan_key:
+            logger.info(f"MiniMax TTS 使用 Coding Plan API Key（优先模式）")
+        else:
+            logger.info(f"MiniMax TTS 使用按量计费 API Key")
         
         self.tts_config = config.get('tts', {})
         minimax_config = self.tts_config.get('minimax', {})
@@ -121,6 +138,46 @@ class MinimaxTTS:
         self._calibration_factors: Dict[str, Dict[str, float]] = {}
         
         logger.info(f"MiniMax TTS初始化完成，基础语速: {self.base_speech_rate}")
+    
+    def _switch_to_pay_as_you_go(self) -> bool:
+        """
+        切换到按量计费 API Key
+        
+        Returns:
+            是否成功切换
+        """
+        if not self.pay_as_you_go_key:
+            logger.error("无法切换：未配置按量计费 API Key")
+            return False
+        
+        if self._current_key_type == 'pay_as_you_go':
+            return True
+        
+        self.api_key = self.pay_as_you_go_key
+        self._current_key_type = 'pay_as_you_go'
+        self._coding_plan_exhausted = True
+        logger.warning("🔄 Coding Plan 可能不支持此操作或已达限额，已切换到按量计费 API Key")
+        return True
+    
+    def get_current_key_type(self) -> str:
+        """获取当前使用的 API Key 类型"""
+        return self._current_key_type
+    
+    def get_usage_summary(self) -> Dict[str, Any]:
+        """
+        获取当前会话的用量摘要
+        
+        Returns:
+            用量摘要字典
+        """
+        # 基础会话统计
+        summary = self.get_cost_summary()
+        
+        # 添加 API Key 状态
+        summary['key_type'] = self._current_key_type
+        summary['coding_plan_exhausted'] = self._coding_plan_exhausted
+        
+        return summary
     
     def set_voice(self, voice_id: str):
         """
@@ -314,6 +371,13 @@ class MinimaxTTS:
                             
                             if status_code == 1002:  # rate limit exceeded
                                 self._release_rate_limit()
+                                
+                                # 如果使用 Coding Plan，尝试切换到按量计费
+                                if self._current_key_type == 'coding_plan' and self.pay_as_you_go_key:
+                                    logger.warning("🔄 Coding Plan 达到限制，尝试切换到按量计费...")
+                                    if self._switch_to_pay_as_you_go():
+                                        continue  # 切换成功，立即重试
+                                
                                 self._handle_minimax_rate_limit(attempt, max_retries)
                                 if attempt < max_retries - 1:
                                     continue

@@ -275,10 +275,8 @@ class AudioConfirmationView:
             if new_text != current_segment.final_text:
                 current_segment.update_final_text(new_text)
             
-        # 语速控制组件 - 仅对支持语速调整的TTS服务显示（ElevenLabs不支持）
-        selected_tts_service = st.session_state.get('selected_tts_service', 'minimax')
-        if selected_tts_service != 'elevenlabs':
-            self._display_speech_rate_control(current_segment, current_index)
+        # 语速控制组件
+        self._display_speech_rate_control(current_segment, current_index)
         
         # 音频预览
         self._display_audio_preview(current_segment, current_index)
@@ -287,12 +285,7 @@ class AudioConfirmationView:
         st.markdown("---")
         
         # 主操作：智能迭代优化
-        # ElevenLabs不支持语速调整，按钮提示文字做区分
-        selected_tts_for_button = st.session_state.get('selected_tts_service', 'minimax')
-        if selected_tts_for_button == 'elevenlabs':
-            optimize_help = "三轮迭代自动优化：生成→优化文本→选最优"
-        else:
-            optimize_help = "三轮迭代自动优化：生成→微调语速/优化文本→选最优"
+        optimize_help = "三轮迭代自动优化：生成→微调语速/优化文本→选最优"
         
         if st.button(
             "🚀 智能迭代优化",
@@ -810,12 +803,9 @@ class AudioConfirmationView:
                 st.error("❌ 文本内容为空")
                 return
             
-            # ElevenLabs不支持语速调整，固定使用1.0
-            if selected_tts_service == 'elevenlabs':
-                user_rate = 1.0
-            else:
-                user_rate_key = f"user_speech_rate_{segment_index}"
-                user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
+            # 获取用户设置的语速
+            user_rate_key = f"user_speech_rate_{segment_index}"
+            user_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             
             with st.spinner("🔄 正在生成音频..."):
                 if selected_tts_service == 'elevenlabs' and selected_voice_id:
@@ -1135,13 +1125,9 @@ class AudioConfirmationView:
             current_text = st.session_state.get(manual_text_key, segment.get_current_text())
             target_duration = segment.target_duration
             
-            # ElevenLabs不支持语速调整，固定使用1.0
-            supports_speech_rate = selected_tts_service != 'elevenlabs'
-            if supports_speech_rate:
-                user_rate_key = f"user_speech_rate_{segment_index}"
-                initial_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
-            else:
-                initial_rate = 1.0
+            # 获取语速设置
+            user_rate_key = f"user_speech_rate_{segment_index}"
+            initial_rate = st.session_state.get(user_rate_key, segment.speech_rate or 1.0)
             
             original_text = segment.original_text or segment.translated_text or current_text
             
@@ -1154,18 +1140,11 @@ class AudioConfirmationView:
                 
                 with progress_container:
                     error_sign = "+" if existing_error_ms > 0 else ""
-                    if supports_speech_rate:
-                        st.markdown(f"""
+                    st.markdown(f"""
 **当前状态** 📊  
 - 实际时长: **{existing_duration:.2f}s** | 目标: {target_duration:.2f}s  
 - 误差: **{error_sign}{existing_error_ms:.0f}ms** | 语速: {initial_rate:.2f}x
-                        """)
-                    else:
-                        st.markdown(f"""
-**当前状态** 📊  
-- 实际时长: **{existing_duration:.2f}s** | 目标: {target_duration:.2f}s  
-- 误差: **{error_sign}{existing_error_ms:.0f}ms**
-                        """)
+                    """)
                 
                 # 检查现有数据是否已达标
                 if -150 <= existing_error_ms <= 0:
@@ -1176,8 +1155,7 @@ class AudioConfirmationView:
             text_optimizer = TextOptimizer(config)
             iteration_optimizer = AudioIterationOptimizer(
                 tts_engine=tts,
-                text_optimizer=text_optimizer,
-                supports_speech_rate=supports_speech_rate
+                text_optimizer=text_optimizer
             )
             
             # 显示优化进度的回调函数
@@ -1213,12 +1191,11 @@ class AudioConfirmationView:
             # 更新UI状态
             st.session_state[manual_text_key] = best.text
             
-            # 语速使用重置机制（仅对支持语速的TTS）
-            if supports_speech_rate:
-                reset_rate_key = f"reset_rate_{segment_index}"
-                suggested_rate_key = f"suggested_rate_{segment_index}"
-                st.session_state[reset_rate_key] = True
-                st.session_state[suggested_rate_key] = best.speech_rate
+            # 语速使用重置机制
+            reset_rate_key = f"reset_rate_{segment_index}"
+            suggested_rate_key = f"suggested_rate_{segment_index}"
+            st.session_state[reset_rate_key] = True
+            st.session_state[suggested_rate_key] = best.speech_rate
             
             # 设置文本重置标记
             reset_key = f"reset_text_{segment.id}"
@@ -1239,19 +1216,13 @@ class AudioConfirmationView:
                 segment.quality = 'poor'
             
             # 显示结果
-            if supports_speech_rate:
-                st.success(f"✅ 智能优化完成！第{best.iteration}轮 | 误差: {best.error_ms:.0f}ms | 语速: {best.speech_rate:.2f}x")
-            else:
-                st.success(f"✅ 智能优化完成！第{best.iteration}轮 | 误差: {best.error_ms:.0f}ms")
+            st.success(f"✅ 智能优化完成！第{best.iteration}轮 | 误差: {best.error_ms:.0f}ms | 语速: {best.speech_rate:.2f}x")
             
             # 显示迭代详情
             with st.expander("📊 迭代详情", expanded=False):
                 for r in all_results:
                     status = "✅" if r == best else "⚪"
-                    if supports_speech_rate:
-                        st.caption(f"{status} 第{r.iteration}轮: 误差={r.error_ms:.0f}ms ({r.error_percentage:.1f}%), 语速={r.speech_rate:.2f}x")
-                    else:
-                        st.caption(f"{status} 第{r.iteration}轮: 误差={r.error_ms:.0f}ms ({r.error_percentage:.1f}%)")
+                    st.caption(f"{status} 第{r.iteration}轮: 误差={r.error_ms:.0f}ms ({r.error_percentage:.1f}%), 语速={r.speech_rate:.2f}x")
             
             st.rerun()
             

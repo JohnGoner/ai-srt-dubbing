@@ -65,6 +65,10 @@ class ElevenLabsTTS:
         self.style = elevenlabs_config.get('style', 0.0)
         self.use_speaker_boost = elevenlabs_config.get('use_speaker_boost', True)
         
+        # ElevenLabs 语速限制：0.7 - 1.2（官方文档限制）
+        self.min_speech_rate = 0.7
+        self.max_speech_rate = 1.2
+        
         # 基础语音参数
         self.base_speech_rate = self.tts_config.get('speech_rate', 1.0)
         self.pitch = self.tts_config.get('pitch', 0)
@@ -252,7 +256,7 @@ class ElevenLabsTTS:
         Args:
             text: 文本内容
             voice_id: 语音ID
-            speech_rate: 语速倍率（ElevenLabs不直接支持，通过后处理实现）
+            speech_rate: 语速倍率 (ElevenLabs API支持 0.7-1.2)
             target_duration: 目标时长
             
         Returns:
@@ -264,6 +268,10 @@ class ElevenLabsTTS:
             try:
                 self._wait_for_rate_limit()
                 self._track_api_call(text)
+                
+                # 计算有效语速，限制在 API 支持范围内 (0.7-1.2)
+                effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
+                api_rate = max(self.min_speech_rate, min(self.max_speech_rate, effective_rate))
                 
                 # 构建请求
                 url = f"{self.base_url}/text-to-speech/{voice_id}"
@@ -281,9 +289,12 @@ class ElevenLabsTTS:
                         "stability": self.stability,
                         "similarity_boost": self.similarity_boost,
                         "style": self.style,
-                        "use_speaker_boost": self.use_speaker_boost
+                        "use_speaker_boost": self.use_speaker_boost,
+                        "speed": api_rate  # 使用API原生语速参数
                     }
                 }
+                
+                logger.debug(f"ElevenLabs TTS请求 - 语速: {api_rate:.3f}")
                 
                 response = requests.post(url, json=payload, headers=headers, timeout=30)
                 
@@ -302,18 +313,8 @@ class ElevenLabsTTS:
                     audio_io = io.BytesIO(audio_data)
                     audio_segment = AudioSegment.from_mp3(audio_io)
                     
-                    # 如果需要调整语速
-                    effective_rate = speech_rate if speech_rate is not None else self.base_speech_rate
-                    if effective_rate != 1.0:
-                        # 通过改变采样率来调整语速
-                        new_frame_rate = int(audio_segment.frame_rate * effective_rate)
-                        audio_segment = audio_segment._spawn(
-                            audio_segment.raw_data,
-                            overrides={'frame_rate': new_frame_rate}
-                        ).set_frame_rate(audio_segment.frame_rate)
-                    
                     actual_duration = len(audio_segment) / 1000.0
-                    logger.debug(f"ElevenLabs音频生成成功 - 语速: {effective_rate:.3f}, 时长: {actual_duration:.2f}s")
+                    logger.debug(f"ElevenLabs音频生成成功 - 语速: {api_rate:.3f}, 时长: {actual_duration:.2f}s")
                     
                     return audio_segment
                     
@@ -413,12 +414,58 @@ class ElevenLabsTTS:
         return estimated_duration
     
     def estimate_optimal_speech_rate(self, text: str, language: str, target_duration: float,
-                                   min_rate: float = 0.5, max_rate: float = 2.0) -> float:
-        """估算达到目标时长所需的最优语速"""
+                                   min_rate: float = None, max_rate: float = None) -> float:
+        """
+        估算达到目标时长所需的最优语速
+        
+        Args:
+            text: 文本内容
+            language: 语言代码
+            target_duration: 目标时长（秒）
+            min_rate: 最小语速（默认 0.7）
+            max_rate: 最大语速（默认 1.2）
+            
+        Returns:
+            最优语速倍率（限制在 0.7-1.2 范围内）
+        """
+        # 使用 ElevenLabs API 支持的语速范围
+        effective_min = min_rate if min_rate is not None else self.min_speech_rate
+        effective_max = max_rate if max_rate is not None else self.max_speech_rate
+        
         base_duration = self.estimate_audio_duration_optimized(text, language, 1.0)
         required_rate = base_duration / target_duration
-        optimal_rate = max(min_rate, min(required_rate, max_rate))
+        optimal_rate = max(effective_min, min(required_rate, effective_max))
+        
+        logger.debug(f"ElevenLabs语速估算: 基础时长={base_duration:.2f}s, 目标={target_duration:.2f}s, "
+                    f"所需={required_rate:.3f}, 最优={optimal_rate:.3f}")
+        
         return optimal_rate
+    
+    def get_optimal_rate_for_language(self, language: str, base_rate: float = 1.0) -> float:
+        """
+        获取语言的最优语速
+        
+        Args:
+            language: 语言代码
+            base_rate: 基础语速
+            
+        Returns:
+            最优语速（限制在 0.7-1.2 范围内）
+        """
+        return max(self.min_speech_rate, min(self.max_speech_rate, base_rate))
+    
+    def get_speech_rate_limits(self) -> Dict[str, float]:
+        """
+        获取语速限制信息
+        
+        Returns:
+            包含语速限制的字典
+        """
+        return {
+            'min': self.min_speech_rate,
+            'max': self.max_speech_rate,
+            'default': 1.0
+        }
     
     def _create_silence_segment(self, segment: Dict[str, Any]) -> Dict[str, Any]:
         """创建静音片段"""
@@ -510,6 +557,140 @@ class ElevenLabsTTS:
             'avg_calls_per_minute': (self.api_call_count / elapsed_time * 60) if elapsed_time > 0 else 0,
             'avg_characters_per_call': (self.total_characters / self.api_call_count) if self.api_call_count > 0 else 0
         }
+    
+    def get_subscription_info(self) -> Dict[str, Any]:
+        """
+        获取 ElevenLabs 订阅信息
+        
+        Returns:
+            订阅信息字典
+        """
+        result = {
+            'success': False,
+            'tier': None,
+            'character_limit': None,
+            'character_count': None,
+            'character_remaining': None,
+            'error': None
+        }
+        
+        try:
+            url = f"{self.base_url}/user/subscription"
+            headers = {
+                "xi-api-key": self.api_key
+            }
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result['success'] = True
+                result['tier'] = data.get('tier', 'unknown')
+                result['character_limit'] = data.get('character_limit', 0)
+                result['character_count'] = data.get('character_count', 0)
+                result['character_remaining'] = result['character_limit'] - result['character_count']
+                result['next_reset'] = data.get('next_character_count_reset_unix')
+                logger.debug(f"ElevenLabs 订阅信息: {result['tier']}, 剩余 {result['character_remaining']}/{result['character_limit']}")
+            else:
+                result['error'] = f"HTTP {response.status_code}"
+                
+        except Exception as e:
+            result['error'] = str(e)
+            logger.warning(f"获取 ElevenLabs 订阅信息失败: {e}")
+        
+        return result
+    
+    def get_character_usage(self, days: int = 30) -> Dict[str, Any]:
+        """
+        获取 ElevenLabs 字符用量统计
+        
+        Args:
+            days: 查询天数，默认30天
+            
+        Returns:
+            用量统计字典
+        """
+        import time as time_module
+        
+        result = {
+            'success': False,
+            'total_characters': 0,
+            'daily_usage': [],
+            'error': None
+        }
+        
+        try:
+            # 计算时间范围（毫秒时间戳）
+            end_unix = int(time_module.time() * 1000)
+            start_unix = end_unix - (days * 24 * 60 * 60 * 1000)
+            
+            url = f"{self.base_url}/usage/character-stats"
+            headers = {
+                "xi-api-key": self.api_key
+            }
+            params = {
+                "start_unix": start_unix,
+                "end_unix": end_unix,
+                "breakdown_type": "none",
+                "aggregation_interval": "day"
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result['success'] = True
+                
+                # 解析时间轴和用量数据
+                times = data.get('time', [])
+                usage = data.get('usage', {})
+                
+                # 计算总用量
+                total = 0
+                daily_data = []
+                
+                # 获取用量数据（可能在 'all' 或其他 key 下）
+                usage_values = usage.get('all', usage.get('none', []))
+                if not usage_values and usage:
+                    # 尝试获取第一个可用的 key
+                    usage_values = list(usage.values())[0] if usage.values() else []
+                
+                for i, ts in enumerate(times):
+                    chars = usage_values[i] if i < len(usage_values) else 0
+                    total += chars
+                    daily_data.append({
+                        'timestamp': ts,
+                        'characters': chars
+                    })
+                
+                result['total_characters'] = total
+                result['daily_usage'] = daily_data[-7:]  # 只返回最近7天
+                
+                logger.debug(f"ElevenLabs {days}天用量: {total} 字符")
+            else:
+                result['error'] = f"HTTP {response.status_code}"
+                
+        except Exception as e:
+            result['error'] = str(e)
+            logger.warning(f"获取 ElevenLabs 用量统计失败: {e}")
+        
+        return result
+    
+    def get_usage_summary(self) -> Dict[str, Any]:
+        """
+        获取完整的用量摘要（订阅信息 + 会话统计）
+        
+        Returns:
+            用量摘要字典
+        """
+        # 基础会话统计
+        summary = self.get_cost_summary()
+        
+        # 获取订阅信息
+        subscription = self.get_subscription_info()
+        summary['subscription'] = subscription
+        
+        return summary
     
     def print_cost_report(self):
         """打印成本报告"""
@@ -614,6 +795,19 @@ class ElevenLabsTTS:
         total_segments = len(segments)
         total_duration = sum(seg.get('actual_duration', seg.get('duration', 0)) for seg in segments)
         
+        # 统计语速分布
+        speeds = [seg.get('final_speed', 1.0) for seg in segments]
+        avg_speed = sum(speeds) / len(speeds) if speeds else 1.0
+        min_speed = min(speeds) if speeds else 1.0
+        max_speed = max(speeds) if speeds else 1.0
+        
+        # ElevenLabs语速分布统计（范围：0.7-1.2）
+        speed_distribution = {
+            'slow': sum(1 for s in speeds if self.min_speech_rate <= s < 1.0),
+            'normal': sum(1 for s in speeds if 0.95 <= s <= 1.05),
+            'fast': sum(1 for s in speeds if 1.0 < s <= self.max_speech_rate)
+        }
+        
         report = f"""ElevenLabs TTS语音合成报告
 ========================
 
@@ -623,6 +817,16 @@ class ElevenLabsTTS:
   - 使用模型: {self.model_id}
   - 稳定性: {self.stability}
   - 相似度增强: {self.similarity_boost}
+
+语速信息:
+  - 支持范围: {self.min_speech_rate} - {self.max_speech_rate}
+  - 平均语速: {avg_speed:.3f}
+  - 语速范围: {min_speed:.3f} - {max_speed:.3f}
+
+语速分布:
+  - 慢速 ({self.min_speech_rate}-1.0): {speed_distribution['slow']} 片段
+  - 正常 (0.95-1.05): {speed_distribution['normal']} 片段
+  - 快速 (1.0-{self.max_speech_rate}): {speed_distribution['fast']} 片段
 """
         
         return report

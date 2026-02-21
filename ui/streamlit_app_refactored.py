@@ -705,6 +705,166 @@ def _get_client_ip() -> str:
         return "unknown"
 
 
+def _show_tts_usage_info(tts_service: str):
+    """
+    在侧边栏显示 TTS 服务用量信息
+    
+    Args:
+        tts_service: 当前选择的 TTS 服务 ('minimax' 或 'elevenlabs')
+    """
+    with st.expander("📊 TTS 用量", expanded=False):
+        try:
+            config = st.session_state.get('config', {})
+            
+            if tts_service == 'minimax':
+                _show_minimax_usage(config)
+            elif tts_service == 'elevenlabs':
+                _show_elevenlabs_usage(config)
+            else:
+                st.info("选择 TTS 服务后查看用量")
+                
+        except Exception as e:
+            st.warning(f"获取用量信息失败: {str(e)}")
+            logger.debug(f"获取 TTS 用量失败: {e}")
+
+
+def _show_minimax_usage(config: dict):
+    """显示 MiniMax 用量信息"""
+    try:
+        import requests
+        
+        # 检查配置
+        api_keys = config.get('api_keys', {})
+        coding_plan_key = api_keys.get('minimax_coding_plan_key', '')
+        pay_as_you_go_key = api_keys.get('minimax_api_key', '')
+        
+        # 显示当前使用的 API 类型
+        if coding_plan_key:
+            st.caption("📌 API: Coding Plan（优先）")
+            
+            # 查询 Coding Plan 用量（使用独立 Session 绕过代理）
+            try:
+                url = "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains"
+                headers = {
+                    "Authorization": f"Bearer {coding_plan_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                with requests.Session() as session:
+                    session.trust_env = False  # 不读系统代理
+                    response = session.get(url, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    base_resp = data.get('base_resp', {})
+                    status_code = base_resp.get('status_code')
+                    
+                    if status_code == 0:
+                        remains_data = data.get('data', {})
+                        # 尝试多种可能的字段名
+                        total = remains_data.get('total_prompt') or remains_data.get('total') or 0
+                        used = remains_data.get('used_prompt') or remains_data.get('used') or 0
+                        remains = remains_data.get('remain_prompt') or remains_data.get('remain') or 0
+                        
+                        if total > 0:
+                            progress = used / total
+                            st.progress(progress, text=f"已用 {used:,} / {total:,}")
+                            
+                            if remains == 0:
+                                st.warning("⚠️ Coding Plan 已用尽")
+                                if pay_as_you_go_key:
+                                    st.caption("✓ 将使用按量计费")
+                            elif remains < total * 0.1:
+                                st.warning(f"⚡ 剩余: {remains:,} (低于10%)")
+                            else:
+                                st.success(f"✅ 剩余: {remains:,}")
+                        elif remains > 0:
+                            st.success(f"✅ 剩余: {remains:,}")
+                        else:
+                            st.caption(f"返回数据: {remains_data}")
+                    else:
+                        error_msg = base_resp.get('status_msg', '未知错误')
+                        st.warning(f"查询失败: {error_msg}")
+                else:
+                    st.caption(f"查询失败: HTTP {response.status_code}")
+                    
+            except requests.RequestException as e:
+                st.caption(f"网络错误: {str(e)[:40]}")
+        else:
+            st.caption("📌 API: 按量计费")
+            if pay_as_you_go_key:
+                st.success("✅ API Key 已配置")
+            else:
+                st.error("❌ 未配置 API Key")
+        
+        # 显示备用 Key 状态
+        if coding_plan_key and pay_as_you_go_key:
+            st.caption("✓ 备用按量计费 Key 已配置")
+            
+    except Exception as e:
+        st.warning(f"MiniMax: {str(e)}")
+
+
+def _show_elevenlabs_usage(config: dict):
+    """显示 ElevenLabs 用量信息"""
+    try:
+        # 检查配置
+        api_keys = config.get('api_keys', {})
+        api_key = api_keys.get('elevenlabs_api_key', '')
+        base_url = api_keys.get('elevenlabs_base_url', 'https://api.elevenlabs.io/v1')
+        
+        if not api_key:
+            st.error("❌ 未配置 API Key")
+            return
+        
+        # 直接调用 API 获取订阅信息
+        import requests
+        
+        try:
+            url = f"{base_url}/user/subscription"
+            headers = {"xi-api-key": api_key}
+            # 使用独立 Session 绕过代理
+            with requests.Session() as session:
+                session.trust_env = False  # 不读系统代理
+                response = session.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                tier = data.get('tier', 'unknown')
+                limit = data.get('character_limit', 0)
+                used = data.get('character_count', 0)
+                remaining = limit - used if limit > 0 else 0
+                
+                # 显示订阅等级
+                st.caption(f"📌 套餐: {tier}")
+                
+                if limit > 0:
+                    progress = used / limit if limit > 0 else 0
+                    st.progress(progress, text=f"已用 {used:,} / {limit:,}")
+                    
+                    if remaining == 0:
+                        st.error("⚠️ 本月额度已用尽")
+                    elif remaining < limit * 0.1:
+                        st.warning(f"⚡ 剩余: {remaining:,} 字符 (低于10%)")
+                    else:
+                        st.success(f"✅ 剩余: {remaining:,} 字符")
+                else:
+                    st.write(f"已使用: {used:,} 字符")
+            elif response.status_code == 401:
+                st.error("❌ API Key 无效或已过期")
+                st.caption("请检查 elevenlabs_api_key 配置")
+            elif response.status_code == 403:
+                st.warning("⚠️ API Key 权限不足")
+            else:
+                st.caption(f"查询失败: HTTP {response.status_code}")
+                
+        except requests.RequestException as e:
+            st.caption(f"网络错误: {str(e)[:50]}")
+            
+    except Exception as e:
+        st.warning(f"ElevenLabs: {str(e)}")
+
+
 def _show_save_project_button():
     """显示保存工程按钮"""
     try:
@@ -1145,6 +1305,9 @@ def main():
                 st.write(f"**模型:** {el_config.get('model_id', 'eleven_multilingual_v2')}")
                 st.write(f"**稳定性:** {el_config.get('stability', 0.5)}")
                 st.write(f"**相似度增强:** {el_config.get('similarity_boost', 0.75)}")
+        
+        # TTS 用量展示
+        _show_tts_usage_info(tts_service)
         
         st.markdown("---")
         
