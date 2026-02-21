@@ -1398,6 +1398,26 @@ class WorkflowManager:
             session_data['processing_stage'] = 'language_selection'
             return session_data
         
+        # 🔥 渐进式生成同步：从 translated_segments 同步音频数据到 confirmation_segments
+        # 解决问题：渐进式生成器修改 translated_segments，但 confirmation_segments 是独立副本
+        if translated_segments and confirmation_segments:
+            synced_count = 0
+            for conf_seg in confirmation_segments:
+                if conf_seg.audio_data is None:
+                    # 在 translated_segments 中查找对应的片段
+                    for trans_seg in translated_segments:
+                        if trans_seg.id == conf_seg.id and trans_seg.audio_data is not None:
+                            conf_seg.set_audio_data(trans_seg.audio_data)
+                            conf_seg.speech_rate = trans_seg.speech_rate
+                            conf_seg.timing_error_ms = trans_seg.timing_error_ms
+                            conf_seg.quality = trans_seg.quality
+                            if trans_seg.final_text:
+                                conf_seg.update_final_text(trans_seg.final_text)
+                            synced_count += 1
+                            break
+            if synced_count > 0:
+                logger.info(f"从渐进式生成结果同步了 {synced_count} 个片段的音频数据")
+        
         # 验证音频数据完整性（同时检查内存音频和云端路径）
         def has_audio_available(seg):
             """检查片段是否有可用音频（内存或云端）"""

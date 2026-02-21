@@ -628,7 +628,7 @@ class FirebaseStorageManager:
         content_type: str = 'audio/mpeg'
     ) -> Optional[str]:
         """
-        上传最终音频文件到 Firebase Storage
+        上传最终音频文件到 Firebase Storage（带重试机制）
         
         Args:
             user_id: 用户 ID
@@ -644,16 +644,47 @@ class FirebaseStorageManager:
             logger.error("Firebase Storage 未连接")
             return None
         
+        import time
+        max_retries = 3
+        
         try:
             storage_path = self._get_user_output_path(user_id, project_id, filename)
             blob = self.bucket.blob(storage_path)
-            blob.upload_from_string(audio_data, content_type=content_type)
             
-            logger.info(f"最终音频上传成功: {storage_path} ({len(audio_data)} bytes)")
-            return storage_path
+            # 🔥 带重试的上传逻辑
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    blob.upload_from_string(audio_data, content_type=content_type)
+                    logger.info(f"最终音频上传成功: {storage_path} ({len(audio_data)} bytes)")
+                    return storage_path
+                except Exception as upload_error:
+                    last_error = upload_error
+                    error_str = str(upload_error).lower()
+                    
+                    # 检查是否是网络/SSL错误
+                    is_network_error = any(keyword in error_str for keyword in [
+                        'proxy', 'connection', 'timeout', 'remotedisconnected', 
+                        'connectionreset', 'max retries', 'ssl', 'write'
+                    ])
+                    
+                    if is_network_error and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 3  # 递增等待: 3s, 6s, 9s
+                        logger.warning(f"最终音频上传失败(网络问题)，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {upload_error}")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+            
+            raise last_error
             
         except Exception as e:
-            logger.error(f"上传最终音频失败: {e}")
+            error_str = str(e).lower()
+            is_network_error = any(k in error_str for k in ['proxy', 'ssl', 'connection', 'timeout'])
+            
+            if is_network_error:
+                logger.warning(f"上传最终音频失败(网络问题，本地文件已保存): {e}")
+            else:
+                logger.error(f"上传最终音频失败: {e}")
             return None
     
     def upload_final_subtitle(
@@ -665,7 +696,7 @@ class FirebaseStorageManager:
         content_type: str = 'text/plain'
     ) -> Optional[str]:
         """
-        上传最终字幕文件到 Firebase Storage
+        上传最终字幕文件到 Firebase Storage（带重试机制）
         
         Args:
             user_id: 用户 ID
@@ -681,16 +712,39 @@ class FirebaseStorageManager:
             logger.error("Firebase Storage 未连接")
             return None
         
+        import time
+        max_retries = 3
+        
         try:
             storage_path = self._get_user_output_path(user_id, project_id, filename)
             blob = self.bucket.blob(storage_path)
-            blob.upload_from_string(subtitle_data, content_type=content_type)
             
-            logger.info(f"最终字幕上传成功: {storage_path} ({len(subtitle_data)} bytes)")
-            return storage_path
+            # 带重试的上传逻辑
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    blob.upload_from_string(subtitle_data, content_type=content_type)
+                    logger.info(f"最终字幕上传成功: {storage_path} ({len(subtitle_data)} bytes)")
+                    return storage_path
+                except Exception as upload_error:
+                    last_error = upload_error
+                    error_str = str(upload_error).lower()
+                    
+                    is_network_error = any(keyword in error_str for keyword in [
+                        'proxy', 'connection', 'timeout', 'ssl', 'write'
+                    ])
+                    
+                    if is_network_error and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"字幕上传失败(网络问题)，{wait_time}秒后重试 ({attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+            
+            raise last_error
             
         except Exception as e:
-            logger.error(f"上传最终字幕失败: {e}")
+            logger.warning(f"上传最终字幕失败(网络问题，可忽略): {e}")
             return None
     
     def upload_segment_audios_batch(

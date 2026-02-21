@@ -558,6 +558,140 @@ class ElevenLabsTTS:
             'avg_characters_per_call': (self.total_characters / self.api_call_count) if self.api_call_count > 0 else 0
         }
     
+    def get_subscription_info(self) -> Dict[str, Any]:
+        """
+        获取 ElevenLabs 订阅信息
+        
+        Returns:
+            订阅信息字典
+        """
+        result = {
+            'success': False,
+            'tier': None,
+            'character_limit': None,
+            'character_count': None,
+            'character_remaining': None,
+            'error': None
+        }
+        
+        try:
+            url = f"{self.base_url}/user/subscription"
+            headers = {
+                "xi-api-key": self.api_key
+            }
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result['success'] = True
+                result['tier'] = data.get('tier', 'unknown')
+                result['character_limit'] = data.get('character_limit', 0)
+                result['character_count'] = data.get('character_count', 0)
+                result['character_remaining'] = result['character_limit'] - result['character_count']
+                result['next_reset'] = data.get('next_character_count_reset_unix')
+                logger.debug(f"ElevenLabs 订阅信息: {result['tier']}, 剩余 {result['character_remaining']}/{result['character_limit']}")
+            else:
+                result['error'] = f"HTTP {response.status_code}"
+                
+        except Exception as e:
+            result['error'] = str(e)
+            logger.warning(f"获取 ElevenLabs 订阅信息失败: {e}")
+        
+        return result
+    
+    def get_character_usage(self, days: int = 30) -> Dict[str, Any]:
+        """
+        获取 ElevenLabs 字符用量统计
+        
+        Args:
+            days: 查询天数，默认30天
+            
+        Returns:
+            用量统计字典
+        """
+        import time as time_module
+        
+        result = {
+            'success': False,
+            'total_characters': 0,
+            'daily_usage': [],
+            'error': None
+        }
+        
+        try:
+            # 计算时间范围（毫秒时间戳）
+            end_unix = int(time_module.time() * 1000)
+            start_unix = end_unix - (days * 24 * 60 * 60 * 1000)
+            
+            url = f"{self.base_url}/usage/character-stats"
+            headers = {
+                "xi-api-key": self.api_key
+            }
+            params = {
+                "start_unix": start_unix,
+                "end_unix": end_unix,
+                "breakdown_type": "none",
+                "aggregation_interval": "day"
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result['success'] = True
+                
+                # 解析时间轴和用量数据
+                times = data.get('time', [])
+                usage = data.get('usage', {})
+                
+                # 计算总用量
+                total = 0
+                daily_data = []
+                
+                # 获取用量数据（可能在 'all' 或其他 key 下）
+                usage_values = usage.get('all', usage.get('none', []))
+                if not usage_values and usage:
+                    # 尝试获取第一个可用的 key
+                    usage_values = list(usage.values())[0] if usage.values() else []
+                
+                for i, ts in enumerate(times):
+                    chars = usage_values[i] if i < len(usage_values) else 0
+                    total += chars
+                    daily_data.append({
+                        'timestamp': ts,
+                        'characters': chars
+                    })
+                
+                result['total_characters'] = total
+                result['daily_usage'] = daily_data[-7:]  # 只返回最近7天
+                
+                logger.debug(f"ElevenLabs {days}天用量: {total} 字符")
+            else:
+                result['error'] = f"HTTP {response.status_code}"
+                
+        except Exception as e:
+            result['error'] = str(e)
+            logger.warning(f"获取 ElevenLabs 用量统计失败: {e}")
+        
+        return result
+    
+    def get_usage_summary(self) -> Dict[str, Any]:
+        """
+        获取完整的用量摘要（订阅信息 + 会话统计）
+        
+        Returns:
+            用量摘要字典
+        """
+        # 基础会话统计
+        summary = self.get_cost_summary()
+        
+        # 获取订阅信息
+        subscription = self.get_subscription_info()
+        summary['subscription'] = subscription
+        
+        return summary
+    
     def print_cost_report(self):
         """打印成本报告"""
         summary = self.get_cost_summary()

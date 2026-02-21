@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.env
+logs/
+models/
+node_modules/
+cloudflared.exe
+cloudflared-config.yml
+*.bat
+.git
