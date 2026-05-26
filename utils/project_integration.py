@@ -48,8 +48,11 @@ class ProjectIntegration:
         config = config_manager.load_config() or {}
         
         if use_firebase is None:
-            # 从配置读取
-            self._use_firebase = config.get('firebase', {}).get('enabled', False)
+            # storage.backend = 'local' 时强制本地（即使 firebase.enabled=true，
+            # 因为某些环境 Firestore 网络不通但 Storage 通，仍想用 Storage 传音频）
+            storage_backend_cfg = config.get('storage', {}).get('backend', 'local')
+            firebase_enabled = config.get('firebase', {}).get('enabled', False)
+            self._use_firebase = firebase_enabled and storage_backend_cfg == 'firebase'
         else:
             self._use_firebase = use_firebase
         
@@ -112,8 +115,8 @@ class ProjectIntegration:
                 description=description
             )
             
-            # 记录项目创建活动日志
-            if self.user_id and project:
+            # 记录项目创建活动日志（仅 firebase 后端，否则会卡死在 Firestore RPC）
+            if self.user_id and project and self._use_firebase:
                 try:
                     from .firebase_activity_logger import get_activity_logger
                     activity_logger = get_activity_logger()
@@ -333,8 +336,8 @@ class ProjectIntegration:
             # 验证数据完整性
             self._validate_session_data_integrity(session_data, project)
             
-            # 记录项目加载活动日志
-            if self.user_id:
+            # 记录项目加载活动日志（仅 firebase 后端，否则会卡死在 Firestore RPC）
+            if self.user_id and self._use_firebase:
                 try:
                     from .firebase_activity_logger import get_activity_logger
                     activity_logger = get_activity_logger()

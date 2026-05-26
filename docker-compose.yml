@@ -16,6 +16,7 @@ services:
       - ./google-credentials.json:/app/google-credentials.json:ro
       - ai-dubbing-logs:/app/logs
       - ai-dubbing-output:/app/output
+      - ai-dubbing-projects:/root/.ai_dubbing_projects
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
       interval: 30s
@@ -31,3 +32,4 @@ services:
 volumes:
   ai-dubbing-logs:
   ai-dubbing-output:
+  ai-dubbing-projects:
