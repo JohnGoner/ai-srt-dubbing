@@ -13,6 +13,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200 \
     TZ=Asia/Shanghai
 
+# 切换到国内 Debian apt 镜像（兼容 sources.list 与 DEB822 两种格式）
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; \
+    fi
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
@@ -21,6 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 用阿里云 pip 镜像加速安装
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
+    && pip config set global.trusted-host mirrors.aliyun.com
 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt

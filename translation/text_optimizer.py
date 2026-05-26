@@ -25,32 +25,21 @@ class TextOptimizer:
         """
         self.config = config
         self.translation_config = config.get('translation', {})
-        self.use_kimi = self.translation_config.get('use_kimi', False)
-        
-        # 根据配置选择API
-        if self.use_kimi:
-            self.api_key = config.get('api_keys', {}).get('kimi_api_key')
-            self.base_url = config.get('api_keys', {}).get('kimi_base_url', 'https://api.moonshot.cn/v1')
-            self.model = self.translation_config.get('model', 'kimi-k2-0711-preview')
-            self.max_tokens = 2000  # 优化任务不需要太多tokens
-            logger.info(f"文本优化使用Kimi API，模型: {self.model}")
+
+        api_keys = config.get('api_keys', {})
+        self.api_key = api_keys.get('minimax_llm_api_key')
+        self.base_url = api_keys.get('minimax_llm_base_url', 'https://api.minimaxi.com/v1')
+        self.model = self.translation_config.get('model', 'MiniMax-M2.7')
+        self.max_tokens = 2000
+        # MiniMax 要求 temperature 必须 > 0 且 <= 1.0
+        self.temperature = 0.1
+
+        if not self.api_key:
+            logger.warning("minimax_llm_api_key 未配置，文本优化功能将不可用")
+            self.client = None
         else:
-            self.api_key = config.get('api_keys', {}).get('openai_api_key')
-            self.base_url = None
-            self.model = self.translation_config.get('model', 'gpt-5.2')
-            self.max_tokens = 1500
-            logger.info(f"文本优化使用OpenAI API，模型: {self.model}")
-        
-        self.temperature = 0.1  # 更低的temperature确保稳定性和一致性
-        
-        # 创建客户端
-        if self.use_kimi:
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url
-            )
-        else:
-            self.client = OpenAI(api_key=self.api_key)
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            logger.info(f"文本优化使用 MiniMax LLM，模型: {self.model}, 端点: {self.base_url}")
         
         # 语言映射
         self.language_names = {

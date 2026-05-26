@@ -15,6 +15,16 @@ BRANCH="${BRANCH:-dev}"
 
 cmd="${1:-deploy}"
 
+# Detect docker compose flavor (V2 plugin "docker compose" or V1 "docker-compose")
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+else
+  echo "[deploy] ERROR: neither 'docker compose' nor 'docker-compose' is available" >&2
+  exit 1
+fi
+
 ensure_repo() {
   if [ ! -d "$APP_DIR/.git" ]; then
     echo "[deploy] cloning $REPO_URL into $APP_DIR ..."
@@ -47,12 +57,12 @@ check_secrets() {
 build_and_up() {
   cd "$APP_DIR"
   echo "[deploy] building image ..."
-  docker compose build
+  $COMPOSE build
   echo "[deploy] starting container ..."
-  docker compose up -d
+  $COMPOSE up -d
   echo "[deploy] waiting for health ..."
   sleep 6
-  docker compose ps
+  $COMPOSE ps
   echo ""
   echo "[deploy] app should be reachable at http://127.0.0.1:8501 (localhost only)"
   echo "[deploy] route via Cloudflare Tunnel to expose publicly."
@@ -68,21 +78,21 @@ case "$cmd" in
     ensure_repo
     check_secrets
     cd "$APP_DIR"
-    docker compose build
-    docker compose up -d
-    docker compose ps
+    $COMPOSE build
+    $COMPOSE up -d
+    $COMPOSE ps
     ;;
   restart)
-    cd "$APP_DIR" && docker compose restart
+    cd "$APP_DIR" && $COMPOSE restart
     ;;
   stop)
-    cd "$APP_DIR" && docker compose down
+    cd "$APP_DIR" && $COMPOSE down
     ;;
   logs)
-    cd "$APP_DIR" && docker compose logs -f --tail=200
+    cd "$APP_DIR" && $COMPOSE logs -f --tail=200
     ;;
   status)
-    cd "$APP_DIR" && docker compose ps && echo "---" && curl -sS http://127.0.0.1:8501/_stcore/health || true
+    cd "$APP_DIR" && $COMPOSE ps && echo "---" && curl -sS http://127.0.0.1:8501/_stcore/health || true
     ;;
   *)
     echo "Usage: $0 {deploy|update|restart|stop|logs|status}"

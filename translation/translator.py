@@ -30,33 +30,24 @@ class Translator:
         """
         self.config = config
         self.translation_config = config.get('translation', {})
-        self.use_kimi = self.translation_config.get('use_kimi', False)
-        
-        # 根据配置选择API
-        if self.use_kimi:
-            self.api_key = config.get('api_keys', {}).get('kimi_api_key')
-            self.base_url = config.get('api_keys', {}).get('kimi_base_url', 'https://api.moonshot.cn/v1')
-            self.model = self.translation_config.get('model', 'kimi-k2-0711-preview')
-            self.max_tokens = self.translation_config.get('max_tokens', 8000)
-            logger.info(f"使用Kimi API，模型: {self.model}")
-        else:
-            self.api_key = config.get('api_keys', {}).get('openai_api_key')
-            self.base_url = None
-            self.model = self.translation_config.get('model', 'gpt-4o')
-            self.max_tokens = self.translation_config.get('max_tokens', 3000)
-            logger.info(f"使用OpenAI API，模型: {self.model}")
-        
+
+        api_keys = config.get('api_keys', {})
+        self.api_key = api_keys.get('minimax_llm_api_key')
+        self.base_url = api_keys.get('minimax_llm_base_url', 'https://api.minimaxi.com/v1')
+        self.model = self.translation_config.get('model', 'MiniMax-M2.7')
+        self.max_tokens = self.translation_config.get('max_tokens', 8000)
+        # 兼容性占位：旧代码引用 use_kimi 时不报错
+        self.use_kimi = True
+
         self.temperature = self.translation_config.get('temperature', 0.3)
         self.system_prompt = self.translation_config.get('system_prompt', '你是一个专业的翻译专家，擅长将各种语言的文本翻译为其他语言。')
-        
-        # 创建客户端
-        if self.use_kimi:
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url
-            )
+
+        if not self.api_key:
+            logger.warning("minimax_llm_api_key 未配置，Translator 将仅用于统计，不可调 LLM")
+            self.client = None
         else:
-            self.client = OpenAI(api_key=self.api_key)
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            logger.info(f"Translator 使用 MiniMax LLM，模型: {self.model}, 端点: {self.base_url}")
         
         # 进度回调
         self.progress_callback = progress_callback
