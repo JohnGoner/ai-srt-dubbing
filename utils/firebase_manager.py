@@ -129,10 +129,11 @@ class FirebaseManager:
                 self.app = firebase_admin.initialize_app(cred, app_options if app_options else None)
                 logger.info(f"Firebase 应用初始化成功, storageBucket={storage_bucket}")
             
-            # 初始化 Firestore
-            self.db = firestore.client()
+            # 初始化 Firestore — 优先 REST transport（绕过 gRPC IPv6 卡死的国内出网问题）
+            # gRPC 在某些云环境下会强制尝试 IPv6 即使 OS 禁用，导致 60s 超时
+            self.db = self._build_firestore_client_rest_first(cred)
             self.is_connected = True
-            
+
             FirebaseManager._initialized = True
             logger.info("Firebase Firestore 连接成功")
             return True
@@ -142,6 +143,34 @@ class FirebaseManager:
             self.is_connected = False
             return False
     
+    def _build_firestore_client_rest_first(self, fa_cred):
+        """
+        构造 Firestore 客户端，优先用 HTTPS REST transport。
+        Why: gRPC 默认 DNS 解析会拿到 AAAA 记录，国内 ECS 多数 IPv6 出网不通，
+             导致 60s+ 卡死。即使 GRPC_DNS_RESOLVER=native 和容器禁 IPv6 都无效，
+             因为 gRPC EventEngine 自己解析 DNS。
+        How: 显式注入 FirestoreRestTransport，所有 RPC 走 HTTPS。
+        若注入失败回落到 gRPC，至少不破坏 Storage / Auth 等其他能力。
+        """
+        try:
+            from google.cloud import firestore as gcf
+            from google.cloud.firestore_v1.services.firestore import client as _low_mod
+            from google.cloud.firestore_v1.services.firestore.transports.rest import FirestoreRestTransport
+
+            google_cred = fa_cred.get_credential()
+            project_id = self.app.project_id
+            db = gcf.Client(project=project_id, credentials=google_cred, database='(default)')
+
+            transport = FirestoreRestTransport(credentials=google_cred)
+            low_level = _low_mod.FirestoreClient(transport=transport)
+            db._firestore_api_internal = low_level
+            db._transport = transport
+            logger.info("Firestore 使用 REST transport（绕过 gRPC IPv6 卡死）")
+            return db
+        except Exception as e:
+            logger.warning(f"REST transport 注入失败 ({e})，回落到 gRPC")
+            return firestore.client()
+
     def set_current_user(self, user_id: str):
         """设置当前用户 ID"""
         self.current_user_id = user_id
