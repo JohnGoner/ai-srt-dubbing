@@ -1,0 +1,107 @@
+# AI配音系统配置模板
+# 复制为 config.yaml 后填入真实密钥，绝不要提交到 Git
+
+api_keys:
+  kimi_api_key: "sk-REPLACE_ME"
+  kimi_base_url: "https://api.moonshot.cn/v1"
+  openai_api_key: "sk-REPLACE_ME"
+  google_credentials_path: "google-credentials.json"
+  minimax_api_key: "REPLACE_ME"
+  minimax_group_id: "REPLACE_ME"
+  minimax_base_url: "https://api.minimax.chat/v1"
+  elevenlabs_api_key: "REPLACE_ME"
+  elevenlabs_base_url: "https://api.elevenlabs.io/v1"
+
+translation:
+  service: "google"
+  context_window_size: 5
+  batch_size: 10
+  max_concurrent_requests: 5
+  use_context: true
+  model: "kimi-k2-0711-preview"
+  segmentation_model: "kimi-k2-0711-preview"
+  max_tokens: 8000
+  temperature: 0.3
+  use_kimi: true
+
+tts:
+  service: "elevenlabs"
+  minimax:
+    voices:
+      en:
+        "English_ReservedYoungMan": "Reserved Young Man"
+      es:
+        "Spanish_MaturePartner": "Jose Luis"
+    pause_settings:
+      major_pause_duration: 0.6
+      minor_pause_duration: 0.25
+      pause_multiplier: 1.2
+  elevenlabs:
+    voices:
+      en:
+        "REPLACE_VOICE_ID": "Voice Name"
+    model_id: "eleven_multilingual_v2"
+    stability: 0.5
+    similarity_boost: 0.75
+    style: 0.0
+    use_speaker_boost: true
+  speech_rate: 1.0
+  pitch: 0
+  volume: 0.8
+
+segmentation:
+  force_segmenter: "auto"
+
+timing:
+  sync_tolerance: 0.20
+  max_iterations: 5
+  max_speed_ratio: 1.15
+  min_speed_ratio: 0.95
+  max_speed_variation: 0.1
+  iteration_time_threshold: 1.0
+  iteration_percent_threshold: 10.0
+  preserve_sentence_integrity: true
+  prefer_speed_over_text: true
+  max_text_reduction: 0.15
+  preferred_breathing_gap: 0.3
+  min_overlap_buffer: 0.05
+  enable_overlap_truncation: false
+  prefer_natural_overlap: true
+
+output:
+  audio_format: "mp3"
+  sample_rate: 48000
+  channels: 1
+  bit_depth: 16
+
+logging:
+  level: "INFO"
+  log_file: "logs/dubbing.log"
+  max_log_size: "10MB"
+  backup_count: 5
+
+firebase:
+  enabled: true
+  credentials_path: "firebase-credentials.json"
+  storage_bucket: "REPLACE.firebasestorage.app"
+  project_id: "REPLACE"
+  api_key: "REPLACE_ME"
+
+storage:
+  backend: "firebase"
+  audio_format: "mp3"
+  audio_bitrate: "128k"
+
+security:
+  enable_auth: true
+  use_firebase_auth: false
+  session_timeout: 60
+  max_login_attempts: 5
+  lockout_duration: 15
+  log_access: true
+  users:
+    admin:
+      # SHA256 of "admin" — change this!
+      password_hash: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+      role: "admin"
+      enabled: true

@@ -1,31 +1,37 @@
-# AI SRT Dubbing 生产 Dockerfile
-# Python 3.9 + FFmpeg + Streamlit
+FROM python:3.11-slim
 
-FROM python:3.9-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_ENABLE_CORS=false \
+    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true \
+    STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200 \
+    TZ=Asia/Shanghai
 
-# 安装 FFmpeg 和系统依赖
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        ca-certificates \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 先复制依赖文件，利用 Docker 缓存
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
-# 复制应用代码
 COPY . .
 
-# 创建日志目录
-RUN mkdir -p logs
+RUN mkdir -p /app/logs /app/output
 
 EXPOSE 8501
 
-# Streamlit 配置: 禁用浏览器自动打开, 允许外部访问
-CMD ["streamlit", "run", "ui/streamlit_app_refactored.py", \
-     "--server.port=8501", \
-     "--server.address=0.0.0.0", \
-     "--server.headless=true", \
-     "--browser.gatherUsageStats=false"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "ui/streamlit_app_refactored.py"]

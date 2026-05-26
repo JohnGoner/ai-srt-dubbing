@@ -1,10 +1,47 @@
-__pycache__
-*.pyc
-.env
-logs/
-models/
-node_modules/
-cloudflared.exe
-cloudflared-config.yml
-*.bat
 .git
+.gitignore
+.github
+.vscode
+.idea
+.cursorrules
+.DS_Store
+
+# Secrets (must be mounted at runtime, never baked into image)
+config.yaml
+firebase-credentials.json
+google-credentials.json
+.env
+.env.*
+.secrets/
+*firebase*admin*.json
+ai-dubbing-system-*.json
+
+# Cloudflare local artifacts
+cloudflared-config.yml
+cloudflared.exe
+run_stable_server.bat
+
+# Runtime data
+logs/
+output/
+*.log
+*.wav
+*.mp3
+*.srt
+
+# Python bytecode / venv
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# Docs / dev-only
+README*.md
+FIREBASE_SETUP.md
+README_AUTH_UPGRADE.md
+
+# Tests
+.pytest_cache/
+.coverage

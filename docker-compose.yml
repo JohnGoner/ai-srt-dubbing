@@ -1,0 +1,29 @@
+services:
+  ai-dubbing:
+    build: .
+    image: ai-srt-dubbing:latest
+    container_name: ai-srt-dubbing
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./firebase-credentials.json:/app/firebase-credentials.json:ro
+      - ./google-credentials.json:/app/google-credentials.json:ro
+      - ai-dubbing-logs:/app/logs
+      - ai-dubbing-output:/app/output
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  ai-dubbing-logs:
+  ai-dubbing-output:
