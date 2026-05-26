@@ -11,7 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_SERVER_ENABLE_CORS=false \
     STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true \
     STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    GRPC_DNS_RESOLVER=native \
+    GRPC_GO_LOG_SEVERITY_LEVEL=warning
 
 # 切换到国内 Debian apt 镜像（兼容 sources.list 与 DEB822 两种格式）
 RUN set -eux; \
@@ -28,6 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 强制优先 IPv4（火山云 ECS IPv6 出网不通，会导致 Firestore gRPC 卡死）
+RUN printf 'precedence ::ffff:0:0/96 100\nprecedence ::/0 10\n' > /etc/gai.conf
 
 WORKDIR /app
 
