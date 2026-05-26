@@ -310,7 +310,7 @@ class AsyncUploadManager:
         """执行 Stage 1 预览音频上传"""
         task.status = UploadTaskStatus.RUNNING
         
-        from .firebase_storage import get_storage_manager
+        from .storage_factory import get_storage_manager
         
         storage = get_storage_manager()
         if not storage.is_connected:
@@ -328,7 +328,7 @@ class AsyncUploadManager:
         """执行 Stage 2 确认音频上传（并删除预览版本）"""
         task.status = UploadTaskStatus.RUNNING
         
-        from .firebase_storage import get_storage_manager
+        from .storage_factory import get_storage_manager
         
         storage = get_storage_manager()
         if not storage.is_connected:
@@ -345,7 +345,7 @@ class AsyncUploadManager:
         """执行最终音频上传"""
         task.status = UploadTaskStatus.RUNNING
         
-        from .firebase_storage import get_storage_manager
+        from .storage_factory import get_storage_manager
         
         storage = get_storage_manager()
         if not storage.is_connected:
@@ -362,7 +362,7 @@ class AsyncUploadManager:
         """执行最终字幕上传"""
         task.status = UploadTaskStatus.RUNNING
         
-        from .firebase_storage import get_storage_manager
+        from .storage_factory import get_storage_manager
         
         storage = get_storage_manager()
         if not storage.is_connected:

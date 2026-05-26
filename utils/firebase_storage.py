@@ -520,6 +520,16 @@ class FirebaseStorageManager:
             logger.error(f"列出项目音频失败: {e}")
             return []
     
+    def check_file_exists(self, storage_path: str) -> bool:
+        """检查 storage_path 是否存在于 bucket。"""
+        if not self.is_connected:
+            return False
+        try:
+            return self.bucket.blob(storage_path).exists()
+        except Exception as e:
+            logger.debug(f"check_file_exists 失败: {storage_path} -> {e}")
+            return False
+
     def get_download_url(self, storage_path: str, expiration: int = 3600) -> Optional[str]:
         """
         获取音频文件的下载 URL

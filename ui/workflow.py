@@ -182,7 +182,7 @@ class WorkflowManager:
             return False
         
         try:
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             from pydub import AudioSegment
             from io import BytesIO
             
@@ -312,17 +312,15 @@ class WorkflowManager:
             current_project = session_data.get('current_project')
             if not current_project:
                 return
-            
-            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
-                return
-            
+            # 后端由 storage_factory 决定（firebase 或 local），不再按项目字段 early-return
+
             user_id = getattr(current_project, 'owner_id', '')
             project_id = getattr(current_project, 'id', '')
-            
+
             if not user_id or not project_id or segment.audio_data is None:
                 return
             
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             from utils.async_upload_manager import get_upload_manager
             
             storage = get_storage_manager()
@@ -598,12 +596,8 @@ class WorkflowManager:
             if not current_project:
                 logger.debug("无项目信息，跳过预览音频上传")
                 return
-            
-            # 检查是否使用 Firebase 存储后端
-            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
-                logger.debug("非 Firebase 存储后端，跳过预览音频上传")
-                return
-            
+            # 后端由 storage_factory 决定（firebase 或 local），无需按项目字段判断
+
             user_id = getattr(current_project, 'owner_id', '')
             project_id = getattr(current_project, 'id', '')
             
@@ -611,7 +605,7 @@ class WorkflowManager:
                 logger.warning("缺少用户 ID 或项目 ID，跳过预览音频上传")
                 return
             
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             from utils.async_upload_manager import get_upload_manager
             
             storage = get_storage_manager()
@@ -1720,18 +1714,14 @@ class WorkflowManager:
             logger.debug("无项目信息，跳过 Firebase Storage 上传")
             return results
         
-        # 检查是否使用 Firebase 存储后端
-        if project.storage_backend != "firebase":
-            logger.debug(f"项目使用 {project.storage_backend} 存储后端，跳过 Firebase Storage 上传")
-            return results
-        
+        # 后端由 storage_factory 决定（firebase 或 local）
         try:
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             from utils.async_upload_manager import get_upload_manager
-            
+
             storage = get_storage_manager()
             if not storage.is_connected:
-                logger.warning("Firebase Storage 未连接，跳过上传")
+                logger.warning("存储后端未连接，跳过上传")
                 return results
             
             user_id = project.owner_id

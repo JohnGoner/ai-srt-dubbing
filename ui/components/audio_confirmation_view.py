@@ -602,11 +602,8 @@ class AudioConfirmationView:
             current_project = st.session_state.get('current_project')
             if not current_project:
                 return ""
-            
-            # 检查是否使用 Firebase 存储后端
-            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
-                return ""
-            
+            # 后端由 storage_factory 决定（firebase URL 或 local 绝对路径），不再按项目字段拦截
+
             # 🔥 优先使用 segment 上已设置的 audio_path
             storage_path = segment.audio_path if segment.audio_path else None
             
@@ -618,7 +615,7 @@ class AudioConfirmationView:
                     storage_path = audio_paths.get(segment.id) or audio_paths.get(f"{segment.id}_preview")
             
             # 获取 Firebase Storage 管理器
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             storage = get_storage_manager()
             if not storage.is_connected:
                 return ""
@@ -637,8 +634,7 @@ class AudioConfirmationView:
                     ]
                     for path in possible_paths:
                         try:
-                            blob = storage.bucket.blob(path)
-                            if blob.exists():
+                            if storage.check_file_exists(path):
                                 storage_path = path
                                 # 找到了，保存到项目中供下次使用
                                 current_project.update_audio_storage_path(segment.id, path)
@@ -656,23 +652,18 @@ class AudioConfirmationView:
             # 新格式: users/{user_id}/projects/{project_id}/audio/preview/{segment_id}.mp3
             if '/audio/segments/' in storage_path:
                 # 检查旧格式路径文件是否存在
-                blob = storage.bucket.blob(storage_path)
-                if not blob.exists():
+                if not storage.check_file_exists(storage_path):
                     # 尝试转换成新格式
                     import re
-                    # 提取路径组件
                     match = re.match(r'(.*/audio)/segments/([^/]+)/(preview|confirmed)\.mp3', storage_path)
                     if match:
-                        base_path = match.group(1)  # users/.../audio
-                        segment_id = match.group(2)  # seg_1
-                        stage = match.group(3)  # preview 或 confirmed
+                        base_path = match.group(1)
+                        segment_id = match.group(2)
+                        stage = match.group(3)
                         new_path = f"{base_path}/{stage}/{segment_id}.mp3"
                         logger.debug(f"片段 {segment.id} 路径兼容转换: {storage_path} -> {new_path}")
-                        # 检查新格式路径是否存在
-                        new_blob = storage.bucket.blob(new_path)
-                        if new_blob.exists():
+                        if storage.check_file_exists(new_path):
                             storage_path = new_path
-                            # 更新项目中的路径映射为正确格式
                             current_project.update_audio_storage_path(segment.id, new_path)
                             segment.audio_path = new_path
             
@@ -702,12 +693,8 @@ class AudioConfirmationView:
             if not current_project:
                 logger.debug("无项目信息，跳过确认音频上传")
                 return
-            
-            # 检查是否使用 Firebase 存储后端
-            if getattr(current_project, 'storage_backend', 'local') != 'firebase':
-                logger.debug("非 Firebase 存储后端，跳过确认音频上传")
-                return
-            
+            # 后端由 storage_factory 决定（firebase 或 local）
+
             user_id = getattr(current_project, 'owner_id', '')
             project_id = getattr(current_project, 'id', '')
             
@@ -719,7 +706,7 @@ class AudioConfirmationView:
                 logger.warning(f"片段 {segment.id} 没有音频数据，跳过上传")
                 return
             
-            from utils.firebase_storage import get_storage_manager
+            from utils.storage_factory import get_storage_manager
             from utils.async_upload_manager import get_upload_manager
             
             storage = get_storage_manager()

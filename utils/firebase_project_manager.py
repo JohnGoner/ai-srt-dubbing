@@ -19,7 +19,8 @@ from loguru import logger
 
 from models.project_dto import ProjectDTO
 from .firebase_manager import get_firebase_manager, FirebaseManager, FIREBASE_AVAILABLE
-from .firebase_storage import get_storage_manager, FirebaseStorageManager
+from .storage_factory import get_storage_manager
+from .firebase_storage import FirebaseStorageManager  # 仅类型注解
 
 
 class SaveDebouncer:
