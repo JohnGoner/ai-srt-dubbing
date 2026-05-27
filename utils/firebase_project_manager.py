@@ -613,13 +613,14 @@ class FirebaseProjectManager:
         self._save_debouncer.flush(use_batch=use_batch)
         logger.info("已刷新所有待保存的项目")
     
-    def load_project(self, project_id: str) -> Optional[ProjectDTO]:
+    def load_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[ProjectDTO]:
         """
         加载项目
-        
+
         Args:
             project_id: 项目 ID
-            
+            user_id: 接口对齐参数；Firebase 后端已通过 user collection 隔离，此处忽略
+
         Returns:
             项目对象，不存在返回 None
         """
@@ -649,14 +650,15 @@ class FirebaseProjectManager:
             logger.error(f"加载项目失败: {e}")
             return None
     
-    def delete_project(self, project_id: str, delete_audio: bool = True) -> bool:
+    def delete_project(self, project_id: str, delete_audio: bool = True, user_id: Optional[str] = None) -> bool:
         """
         删除项目
-        
+
         Args:
             project_id: 项目 ID
             delete_audio: 是否同时删除音频文件
-            
+            user_id: 接口对齐参数；Firebase 后端已通过 user collection 隔离，此处忽略
+
         Returns:
             是否删除成功
         """
@@ -684,19 +686,21 @@ class FirebaseProjectManager:
             return False
     
     def list_projects(
-        self, 
+        self,
         include_shared: bool = False,
         order_by: str = 'updated_at',
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        user_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         获取项目列表
-        
+
         Args:
             include_shared: 是否包含共享项目
             order_by: 排序字段
             limit: 限制返回数量
-            
+            user_id: 接口对齐参数；Firebase 后端已通过 user collection 隔离，此处忽略
+
         Returns:
             项目信息列表
         """
@@ -769,14 +773,15 @@ class FirebaseProjectManager:
             logger.error(f"搜索项目失败: {e}")
             return []
     
-    def duplicate_project(self, project_id: str, new_name: str = "") -> Optional[ProjectDTO]:
+    def duplicate_project(self, project_id: str, new_name: str = "", user_id: Optional[str] = None) -> Optional[ProjectDTO]:
         """
         复制项目
-        
+
         Args:
             project_id: 原项目 ID
             new_name: 新项目名称
-            
+            user_id: 接口对齐参数；Firebase 后端已通过 user collection 隔离，此处忽略
+
         Returns:
             新项目对象
         """

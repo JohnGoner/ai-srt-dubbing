@@ -276,7 +276,7 @@ class ProjectIntegration:
             是否加载成功
         """
         try:
-            project = self.project_manager.load_project(project_id)
+            project = self.project_manager.load_project(project_id, user_id=self.user_id)
             if not project:
                 logger.error(f"工程不存在: {project_id}")
                 return False
@@ -440,7 +440,7 @@ class ProjectIntegration:
         """
         try:
             file_hash = hashlib.md5(file_content).hexdigest()
-            projects = self.project_manager.list_projects()
+            projects = self.project_manager.list_projects(user_id=self.user_id)
             
             matching_projects = []
             for project_info in projects:
@@ -704,7 +704,7 @@ class ProjectIntegration:
         """
         try:
             # 获取所有工程的文件哈希
-            projects = self.project_manager.list_projects()
+            projects = self.project_manager.list_projects(user_id=self.user_id)
             project_hashes = set()
             for project_info in projects:
                 if project_info.get("file_hash"):

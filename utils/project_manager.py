@@ -53,6 +53,14 @@ class ProjectManager:
                           f"移除孤立文件{repair_stats.get('orphaned_data_removed', 0)}个")
         except Exception as e:
             logger.warning(f"完整性检查失败，但不影响正常使用: {e}")
+
+        # 一次性回填: 老索引缺 owner_id 时从 pkl 内的 ProjectDTO 抽取
+        try:
+            backfilled = self._backfill_owner_ids_from_pkl()
+            if backfilled > 0:
+                logger.info(f"回填 owner_id 完成: {backfilled} 个工程")
+        except Exception as e:
+            logger.warning(f"回填 owner_id 失败，但不影响正常使用: {e}")
         
         logger.info(f"工程管理器初始化完成: {self.projects_dir}")
         logger.info(f"发现 {len(self.projects_index.get('projects', {}))} 个工程")
@@ -199,6 +207,7 @@ class ProjectManager:
                     "id": project.id,
                     "name": project.name,
                     "description": project.description,
+                    "owner_id": getattr(project, 'owner_id', '') or getattr(project, 'created_by', ''),
                     "created_at": project.created_at,
                     "updated_at": project.updated_at,
                     "processing_stage": project.processing_stage,
@@ -244,13 +253,14 @@ class ProjectManager:
             logger.error(f"保存工程失败: {e}")
             return False
     
-    def load_project(self, project_id: str) -> Optional[ProjectDTO]:
+    def load_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[ProjectDTO]:
         """
         加载工程
-        
+
         Args:
             project_id: 工程ID
-            
+            user_id: 若提供则校验工程所有权，跨用户拒绝（防 URL 篡改）
+
         Returns:
             工程对象，如果不存在则返回None
         """
@@ -258,7 +268,13 @@ class ProjectManager:
             if project_id not in self.projects_index["projects"]:
                 logger.warning(f"工程不存在: {project_id}")
                 return None
-            
+
+            if user_id:
+                owner = self.projects_index["projects"][project_id].get("owner_id", "")
+                if owner and owner != user_id:
+                    logger.warning(f"拒绝跨用户访问: {user_id} -> {project_id} (owner={owner})")
+                    return None
+
             project_data_file = self.projects_data_dir / f"{project_id}.pkl"
             if not project_data_file.exists():
                 logger.warning(f"工程数据文件不存在: {project_data_file}")
@@ -285,29 +301,36 @@ class ProjectManager:
             logger.error(f"加载工程失败: {e}")
             return None
     
-    def list_projects(self, include_shared: bool = True) -> List[Dict[str, Any]]:
+    def list_projects(self, include_shared: bool = True, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         获取工程列表
-        
+
         Args:
             include_shared: 是否包含共享工程
-            
+            user_id: 当前用户 ID；提供时按 owner_id 过滤，仅返回该用户拥有的工程
+
         Returns:
             工程信息列表
         """
         try:
             projects_list = []
-            
+
             for project_id, project_info in self.projects_index["projects"].items():
                 if not include_shared and project_info.get("is_shared", False):
                     continue
-                
+
+                if user_id:
+                    owner = project_info.get("owner_id", "")
+                    # 共享工程对所有用户可见；非共享工程严格按 owner 过滤
+                    if owner and owner != user_id and not project_info.get("is_shared", False):
+                        continue
+
                 # 检查数据文件是否存在
                 project_data_file = self.projects_data_dir / f"{project_id}.pkl"
                 if not project_data_file.exists():
                     logger.warning(f"工程数据文件丢失: {project_id}")
                     continue
-                
+
                 projects_list.append(project_info.copy())
             
             # 按更新时间排序（最新的在前）
@@ -319,13 +342,14 @@ class ProjectManager:
             logger.error(f"获取工程列表失败: {e}")
             return []
     
-    def delete_project(self, project_id: str) -> bool:
+    def delete_project(self, project_id: str, user_id: Optional[str] = None) -> bool:
         """
         删除工程
-        
+
         Args:
             project_id: 工程ID
-            
+            user_id: 若提供则校验所有权，跨用户删除会被拒绝
+
         Returns:
             是否删除成功
         """
@@ -333,7 +357,13 @@ class ProjectManager:
             if project_id not in self.projects_index["projects"]:
                 logger.warning(f"要删除的工程不存在: {project_id}")
                 return False
-            
+
+            if user_id:
+                owner = self.projects_index["projects"][project_id].get("owner_id", "")
+                if owner and owner != user_id:
+                    logger.warning(f"拒绝跨用户删除: {user_id} -> {project_id} (owner={owner})")
+                    return False
+
             # 删除数据文件
             project_data_file = self.projects_data_dir / f"{project_id}.pkl"
             if project_data_file.exists():
@@ -357,23 +387,24 @@ class ProjectManager:
             del self.projects_index["projects"][project_id]
             self._save_projects_index()
     
-    def duplicate_project(self, project_id: str, new_name: str = "") -> Optional[ProjectDTO]:
+    def duplicate_project(self, project_id: str, new_name: str = "", user_id: Optional[str] = None) -> Optional[ProjectDTO]:
         """
         复制工程
-        
+
         Args:
             project_id: 原工程ID
             new_name: 新工程名称
-            
+            user_id: 若提供则校验源工程所有权；副本 owner 设为该用户
+
         Returns:
             新工程对象
         """
         try:
-            # 加载原工程
-            original_project = self.load_project(project_id)
+            # 加载原工程（带所有权校验）
+            original_project = self.load_project(project_id, user_id=user_id)
             if not original_project:
                 return None
-            
+
             # 创建副本
             project_dict = original_project.to_dict()
             project_dict["id"] = ""  # 重新生成ID
@@ -382,7 +413,10 @@ class ProjectManager:
             project_dict["updated_at"] = datetime.now(timezone.utc).isoformat()
             project_dict["is_shared"] = False
             project_dict["share_url"] = ""
-            
+            if user_id:
+                project_dict["owner_id"] = user_id
+                project_dict["created_by"] = user_id
+
             new_project = ProjectDTO.from_dict(project_dict)
             
             # 保存新工程
@@ -758,36 +792,52 @@ class ProjectManager:
             logger.error(f"搜索工程失败: {e}")
             return []
     
-    def get_projects_statistics(self) -> Dict[str, Any]:
-        """获取工程统计信息"""
+    def get_projects_statistics(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取工程统计信息
+
+        Args:
+            user_id: 若提供则只统计该用户拥有（或共享）的工程
+        """
         try:
             stats = self.projects_index["statistics"].copy()
-            
+
             # 按状态统计
             stage_stats = {}
             language_stats = {}
             total_size = 0
-            
+            counted = 0
+
             for project_info in self.projects_index["projects"].values():
+                if user_id:
+                    owner = project_info.get("owner_id", "")
+                    if owner and owner != user_id and not project_info.get("is_shared", False):
+                        continue
+
+                counted += 1
                 # 状态统计
                 stage = project_info.get("processing_stage", "unknown")
                 stage_stats[stage] = stage_stats.get(stage, 0) + 1
-                
+
                 # 语言统计
                 lang = project_info.get("target_language", "")
                 if lang:
                     language_stats[lang] = language_stats.get(lang, 0) + 1
-                
+
                 # 大小统计
                 total_size += project_info.get("data_file_size", 0)
-            
+
+            if user_id is not None:
+                # 重写 total_projects 以反映用户视角
+                stats["total_projects"] = counted
+
             stats.update({
                 "stage_statistics": stage_stats,
                 "language_statistics": language_stats,
                 "total_size_bytes": total_size,
                 "total_size_mb": total_size / (1024 * 1024)
             })
-            
+
             return stats
             
         except Exception as e:
@@ -872,6 +922,39 @@ class ProjectManager:
         except Exception as e:
             logger.error(f"工程完整性检查失败: {e}")
             return {"error": str(e)}
+
+    def _backfill_owner_ids_from_pkl(self) -> int:
+        """
+        把 owner_id 字段从 pkl 回填到 projects_index。
+
+        旧版本 save_project 没把 owner_id 写入 index，导致 list_projects
+        按用户过滤时拿不到所有权信息。本方法只回填缺失字段，已有的不动。
+
+        Returns:
+            实际更新的工程数
+        """
+        updated = 0
+        for project_id, project_info in self.projects_index["projects"].items():
+            if project_info.get("owner_id"):
+                continue
+            pkl = self.projects_data_dir / f"{project_id}.pkl"
+            if not pkl.exists():
+                continue
+            try:
+                with open(pkl, 'rb') as f:
+                    project = pickle.load(f)
+                if not isinstance(project, ProjectDTO):
+                    continue
+                owner = getattr(project, 'owner_id', '') or getattr(project, 'created_by', '')
+                if owner:
+                    project_info["owner_id"] = owner
+                    updated += 1
+            except Exception as e:
+                logger.debug(f"回填 owner_id 跳过 {project_id}: {e}")
+
+        if updated > 0:
+            self._save_projects_index()
+        return updated
 
     def cleanup_old_projects(self, max_age_days: int = 90, max_projects: int = 50):
         """

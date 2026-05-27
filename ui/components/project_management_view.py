@@ -67,7 +67,7 @@ class ProjectManagementView:
     
     def _render_main_content(self) -> Dict[str, Any]:
         """渲染主要内容（极简设计）"""
-        projects = self.project_manager.list_projects()
+        projects = self.project_manager.list_projects(user_id=_get_current_user_id())
         
         # 创建新工程按钮（始终显示在顶部）
         col1, col2, col3 = st.columns([1, 2, 1])
@@ -192,7 +192,7 @@ class ProjectManagementView:
             st.header("📊 统计")
             
             try:
-                stats = self.project_manager.get_projects_statistics()
+                stats = self.project_manager.get_projects_statistics(user_id=_get_current_user_id())
                 total_projects = stats.get("total_projects", 0)
                 total_size_mb = stats.get("total_size_mb", 0)
                 
@@ -218,7 +218,7 @@ class ProjectManagementView:
     # 简化版本已取代复杂的tab系统，保留核心功能方法
     def _show_project_details(self, project_id: str):
         """显示工程详情（简化版）"""
-        project = self.project_manager.load_project(project_id)
+        project = self.project_manager.load_project(project_id, user_id=_get_current_user_id())
         if project:
             with st.expander(f"📋 工程详情: {project.name}", expanded=True):
                 col1, col2 = st.columns(2)
@@ -273,7 +273,7 @@ class ProjectManagementView:
     def _duplicate_project(self, project_id: str, project_name: str):
         """复制工程"""
         try:
-            new_project = self.project_manager.duplicate_project(project_id, f"{project_name} - 副本")
+            new_project = self.project_manager.duplicate_project(project_id, f"{project_name} - 副本", user_id=_get_current_user_id())
             if new_project:
                 st.success(f"✅ 工程复制成功: {new_project.name}")
                 st.rerun()
@@ -328,7 +328,7 @@ class ProjectManagementView:
                     logger.info(f"用户确认删除工程: {project_name} (ID: {project_id})")
                     
                     # 执行删除
-                    success = self.project_manager.delete_project(project_id)
+                    success = self.project_manager.delete_project(project_id, user_id=_get_current_user_id())
                     
                     if success:
                         st.success(f"✅ 工程 `{project_name}` 删除成功！")
@@ -431,8 +431,8 @@ class ProjectManagementView:
             包含action和数据的结果字典
         """
         try:
-            # 加载工程信息
-            project = self.project_manager.load_project(project_id)
+            # 加载工程信息（带所有权校验，防止 URL 篡改跨用户访问）
+            project = self.project_manager.load_project(project_id, user_id=_get_current_user_id())
             if not project:
                 st.error("❌ 工程不存在或已损坏")
                 return {"action": "back_to_home"}
